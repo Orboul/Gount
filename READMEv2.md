@@ -1,6 +1,6 @@
 # Adding gount to your website
 
-Drop one of the snippets below into any page — that's all it takes. Every hit records the visitor's country, page path, referrer, and a privacy-safe anonymous ID. No cookies, no personal data stored.
+Drop one of the snippets below into any page. Every hit records the visitor's country, page path, referrer, and a privacy-safe anonymous ID. No cookies, no personal data stored.
 
 ---
 
@@ -17,7 +17,7 @@ Fires automatically on page load. Captures the current path from the browser and
 </script>
 ```
 
-Place it just before `</body>`. The `keepalive: true` flag ensures the ping completes even if the visitor navigates away immediately.
+Place it just before `</body>`. The `keepalive: true` flag helps the ping complete even if the visitor navigates away immediately.
 
 ---
 
@@ -36,7 +36,7 @@ A 1×1 invisible image. Works without JavaScript and in HTML emails, but you set
 | `p` | The page or item name being tracked | `p=homepage`, `p=shop/item-42` |
 | `ref` | Where the visitor came from | `ref=newsletter`, `ref=twitter` |
 
-Both parameters are optional but recommended.
+Both parameters are optional, but recommended.
 
 **Full example — tracking a product page linked from an email campaign:**
 
@@ -46,9 +46,9 @@ Both parameters are optional but recommended.
 
 This records:
 
-```
-path     → shop/item-42
-referrer → email-may
+```text
+path     -> shop/item-42
+referrer -> email-may
 ```
 
 ---
@@ -76,7 +76,7 @@ The script handles JavaScript-enabled browsers; the pixel catches everything els
 | Field | Example | Notes |
 |---|---|---|
 | `path` | `/shop/item-42` | From the `?p=` parameter |
-| `referrer` | `google.com` | From `?ref=` or the browser's Referer header |
+| `referrer` | `google.com` | From `?ref=` or the browser `Referer` host |
 | `country` | `CA` | ISO country code from GeoIP |
 | `city` | `Toronto` | Only populated when `geo_type: city` |
 | `unique_id` | `a3f9...` | Hashed — raw IP is never stored |
@@ -88,13 +88,13 @@ The script handles JavaScript-enabled browsers; the pixel catches everything els
 
 Add `?ref=<source>` to any link pointing at your site to tag where that traffic came from. The tracker picks it up automatically.
 
-```
+```text
 https://yoursite.com/landing?ref=newsletter
 https://yoursite.com/landing?ref=twitter
 https://yoursite.com/landing?ref=partner-acme
 ```
 
-If someone arrives without a `?ref=` and without a browser Referer header, the referrer is stored as `Direct`.
+If someone arrives without a `?ref=` and without a browser `Referer` header, the referrer is stored as `Direct`.
 
 ## Reverse proxy note
 

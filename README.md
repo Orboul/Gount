@@ -255,7 +255,7 @@ MaxMind updates GeoLite2 every Tuesday. The `update_frequency_days` config value
 Requires Go 1.24 or newer.
 
 ```bash
-git clone https://github.com/youruser/gount
+git clone https://github.com/orboul/gount
 cd gount
 cd go
 go build -o ../gount .
