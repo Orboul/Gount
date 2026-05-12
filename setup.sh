@@ -56,11 +56,26 @@ build_binary() {
 # ─── Install ──────────────────────────────────────────────────────────────────
 install_binary() {
     local source_dir="$1"
+    local target_path="$INSTALL_DIR/gount"
+    local reply
 
     step "Installing"
     mkdir -p "$INSTALL_DIR"
-    install -m 755 "$source_dir/gount" "$INSTALL_DIR/gount"
-    info "Binary installed  →  $INSTALL_DIR/gount"
+    install -m 644 "$source_dir/gount" "$target_path"
+    info "Binary installed  →  $target_path"
+
+    echo
+    label "Executable permission"
+    ask "Would you like setup to make the gount binary executable now?"
+    read -rp "  Make executable? [Y/n] " reply
+    if [[ "$reply" =~ ^[Nn]$ ]]; then
+        warn "Left binary non-executable."
+        echo -e "  To make it executable later:"
+        echo -e "    ${BOLD}chmod +x ${target_path}${NC}"
+    else
+        chmod +x "$target_path"
+        info "Binary marked executable"
+    fi
 }
 
 # ─── Config ───────────────────────────────────────────────────────────────────
@@ -434,7 +449,8 @@ main() {
     info "Config            →  $INSTALL_DIR/config.yaml"
     info "README            →  $INSTALL_DIR/README.md"
     echo
-    echo -e "  To start:  ${BOLD}$INSTALL_DIR/gount${NC}"
+    echo -e "  To start gount: .${INSTALL_DIR}/gount"
+    
     echo
 }
 
