@@ -4,6 +4,13 @@
 
 It is designed for people who want simple traffic tracking without handing visitor data to a third party. You run it yourself, point your site at it, and it records visits using a small HTTP endpoint.
 
+## Simple Install
+
+This will download, build, and configer your gount program.
+```bash
+curl -fsSL https://raw.githubusercontent.com/Orboul/Gount/main/setup.sh -o setup.sh && bash setup.sh
+```
+
 ## What it does
 
 When a browser requests the tracking endpoint, gount:
