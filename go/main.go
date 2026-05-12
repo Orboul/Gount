@@ -1,4 +1,4 @@
-// apkount - A lightweight, privacy-first pixel tracker written in Go.
+// gount - A lightweight, privacy-first pixel tracker written in Go.
 //
 // It exposes a single /t endpoint that:
 //   - Derives a pseudonymous User ID from IP + User-Agent + secret salt (SHA-256)
@@ -71,7 +71,7 @@ type Config struct {
 	UpdateFrequencyDays int    `yaml:"update_frequency_days"`
 }
 
-const defaultConfigYAML = `# apkount configuration
+const defaultConfigYAML = `# gount configuration
 # -------------------------------------------------------------------
 
 # TCP port the tracker listens on.
@@ -93,8 +93,8 @@ db_type: "sqlite"
 db_path: ""
 
 # For postgres / mysql — full DSN connection string.
-# postgres example: postgres://user:pass@localhost:5432/apkount?sslmode=disable
-# mysql example:    user:pass@tcp(localhost:3306)/apkount?parseTime=true
+# postgres example: postgres://user:pass@localhost:5432/gount?sslmode=disable
+# mysql example:    user:pass@tcp(localhost:3306)/gount?parseTime=true
 db_dsn: ""
 
 # GeoLite2 edition: "country" (smaller) or "city" (includes city name).

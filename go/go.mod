@@ -1,4 +1,4 @@
-module github.com/matthewsaw/apkount
+module github.com/matthewsaw/gount
 
 go 1.24.0
 

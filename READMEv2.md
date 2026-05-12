@@ -1,4 +1,4 @@
-# Adding apkount to your website
+# Adding gount to your website
 
 Drop one of the snippets below into any page — that's all it takes. Every hit records the visitor's country, page path, referrer, and a privacy-safe anonymous ID. No cookies, no personal data stored.
 

@@ -1,4 +1,4 @@
-# apkount
+# gount
 
 A lightweight, self-hosted, privacy-first page-view tracker written in Go.
 
@@ -27,11 +27,11 @@ A background goroutine prunes rows older than `retention_days` once every 24 hou
 
 ```bash
 # 1. Download the binary for your platform from the releases page, e.g.:
-curl -LO https://github.com/youruser/apkount/releases/latest/download/apkount-linux-amd64
-chmod +x apkount-linux-amd64
+curl -LO https://github.com/youruser/gount/releases/latest/download/gount-linux-amd64
+chmod +x gount-linux-amd64
 
 # 2. Run it — on first launch it writes config.yaml and downloads GeoLite2-Country.mmdb
-./apkount-linux-amd64
+./gount-linux-amd64
 
 # 3. Edit config.yaml (change secret_salt at minimum), then restart
 ```
@@ -39,7 +39,7 @@ chmod +x apkount-linux-amd64
 After the first run the directory looks like this:
 
 ```
-apkount-linux-amd64
+gount-linux-amd64
 config.yaml
 data/
   visits.db           ← SQLite (default)
@@ -54,7 +54,7 @@ data/
 All settings live in `config.yaml` next to the binary. You can also pass an explicit path as the first CLI argument:
 
 ```bash
-./apkount /etc/apkount/config.yaml
+./gount /etc/gount/config.yaml
 ```
 
 ### Full annotated config
@@ -81,8 +81,8 @@ db_type: "sqlite"
 db_path: ""
 
 # Full DSN for postgres or mysql backends. Ignored for file-based backends.
-# postgres:  postgres://user:pass@localhost:5432/apkount?sslmode=disable
-# mysql:     user:pass@tcp(localhost:3306)/apkount?parseTime=true
+# postgres:  postgres://user:pass@localhost:5432/gount?sslmode=disable
+# mysql:     user:pass@tcp(localhost:3306)/gount?parseTime=true
 db_dsn: ""
 
 # ── Geo-lookup ───────────────────────────────────────────────────────────────
@@ -187,7 +187,7 @@ Use both: the JS version fires when scripts are allowed, the pixel fires when th
 
 ## Running behind a reverse proxy
 
-apkount reads `X-Forwarded-For` and `X-Real-IP` to get the real client IP. Make sure your proxy sets one of these headers.
+gount reads `X-Forwarded-For` and `X-Real-IP` to get the real client IP. Make sure your proxy sets one of these headers.
 
 **nginx:**
 ```nginx
@@ -213,7 +213,7 @@ The binary only auto-downloads the `.mmdb` on first run. To refresh it later, de
 
 ```bash
 rm data/geodata/GeoLite2-Country.mmdb
-systemctl restart apkount
+systemctl restart gount
 ```
 
 MaxMind updates GeoLite2 every Tuesday. The `update_frequency_days` config value is a reminder only — it does not trigger any automated refresh.
@@ -225,9 +225,9 @@ MaxMind updates GeoLite2 every Tuesday. The `update_frequency_days` config value
 Requires Go 1.22+.
 
 ```bash
-git clone https://github.com/youruser/apkount
-cd apkount
-go build -o apkount .
+git clone https://github.com/youruser/gount
+cd gount
+go build -o gount .
 ```
 
 To cross-compile for all platforms at once:
@@ -253,14 +253,14 @@ Useful for load-balancer probes, uptime monitors, and `systemd` liveness checks.
 
 ```ini
 [Unit]
-Description=apkount tracker
+Description=gount tracker
 After=network.target
 
 [Service]
 Type=simple
-User=apkount
-WorkingDirectory=/opt/apkount
-ExecStart=/opt/apkount/apkount
+User=gount
+WorkingDirectory=/opt/gount
+ExecStart=/opt/gount/gount
 Restart=on-failure
 
 [Install]
@@ -268,5 +268,5 @@ WantedBy=multi-user.target
 ```
 
 ```bash
-sudo systemctl enable --now apkount
+sudo systemctl enable --now gount
 ```
