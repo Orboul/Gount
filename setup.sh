@@ -4,7 +4,7 @@ set -euo pipefail
 # ─── Config ───────────────────────────────────────────────────────────────────
 REQUIRED="1.24.0"
 REPO="https://github.com/Orboul/Gount.git"
-INSTALL_DIR="$(pwd)/gount"
+INSTALL_DIR="$(pwd)"
 SERVICE_NAME="gount"
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -17,6 +17,12 @@ label()   { echo -e "  ${BOLD}$*${NC}"; }
 ask()     { echo -e "  ${DIM}$*${NC}"; }
 
 divider() { echo -e "\n  ${DIM}$(printf '━%.0s' {1..50})${NC}\n"; }
+
+ensure_install_dir_ready() {
+    if [[ -d "$INSTALL_DIR/gount" ]]; then
+        error "A directory already exists at $INSTALL_DIR/gount. Run setup from a clean base directory, or remove/rename that folder first."
+    fi
+}
 
 # ─── Go version check ─────────────────────────────────────────────────────────
 check_go() {
@@ -431,6 +437,7 @@ main() {
     [[ "$reply" =~ ^[Nn]$ ]] && { echo "  Aborted."; exit 0; }
     echo
 
+    ensure_install_dir_ready
     check_go
 
     local source_dir
@@ -449,7 +456,8 @@ main() {
     info "Config            →  $INSTALL_DIR/config.yaml"
     info "README            →  $INSTALL_DIR/README.md"
     echo
-    echo -e "  To start gount: .${INSTALL_DIR}/gount"
+    echo -e "  To start gount:"
+    echo -e "    ${BOLD}${INSTALL_DIR}/gount${NC}"
     
     echo
 }
