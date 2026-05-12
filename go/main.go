@@ -418,11 +418,24 @@ func extractReferrer(raw string) string {
 // ---------------------------------------------------------------------------
 
 type sqlStore struct {
-	db     *sql.DB
-	dbType string
+	mu                       sync.Mutex
+	db                       *sql.DB
+	dbType                   string
+	dsn                      string
+	lastSQLiteExistenceCheck time.Time
 }
 
+const sqliteExistenceCheckInterval = 5 * time.Second
+
 func newSQLStore(dbType, dsn string) (*sqlStore, error) {
+	db, err := openSQLDB(dbType, dsn)
+	if err != nil {
+		return nil, err
+	}
+	return &sqlStore{db: db, dbType: dbType, dsn: dsn}, nil
+}
+
+func openSQLDB(dbType, dsn string) (*sql.DB, error) {
 	driver := dbType
 	if dbType == "sqlite" {
 		driver = "sqlite"
@@ -454,7 +467,7 @@ func newSQLStore(dbType, dsn string) (*sqlStore, error) {
 
 	migrateReferrer(db, dbType)
 
-	return &sqlStore{db: db, dbType: dbType}, nil
+	return db, nil
 }
 
 // sqlSchema returns the CREATE TABLE statement for the given driver dialect.
@@ -514,6 +527,15 @@ func migrateReferrer(db *sql.DB, dbType string) {
 }
 
 func (s *sqlStore) InsertVisit(uniqueID, country, city, path, referrer string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.dbType == "sqlite" {
+		if err := s.ensureSQLitePresentLocked(); err != nil {
+			return fmt.Errorf("sqlite insert failed while preparing local database: %w", err)
+		}
+	}
+
 	var q string
 	if s.dbType == "postgres" {
 		q = `INSERT INTO visits (unique_id, country, city, path, referrer, timestamp) VALUES ($1, $2, $3, $4, $5, $6)`
@@ -521,13 +543,42 @@ func (s *sqlStore) InsertVisit(uniqueID, country, city, path, referrer string) e
 		q = `INSERT INTO visits (unique_id, country, city, path, referrer, timestamp) VALUES (?, ?, ?, ?, ?, ?)`
 	}
 	_, err := s.db.Exec(q, uniqueID, country, city, path, referrer, time.Now().UTC().Unix())
+	if err == nil {
+		return nil
+	}
+
+	if s.dbType == "sqlite" && shouldRecoverSQLite(err) {
+		log.Printf("[store] sqlite database missing or incomplete, attempting recovery: %v", err)
+		if recoverErr := s.reopenSQLiteLocked(); recoverErr != nil {
+			return fmt.Errorf("sqlite insert failed after recovery attempt: %w", recoverErr)
+		}
+		_, err = s.db.Exec(q, uniqueID, country, city, path, referrer, time.Now().UTC().Unix())
+		if err == nil {
+			log.Printf("[store] sqlite database recovered and write retried successfully")
+			return nil
+		}
+		return fmt.Errorf("sqlite insert failed after recovery retry: %w", err)
+	}
+
 	if err != nil {
+		if s.dbType == "sqlite" {
+			return fmt.Errorf("sqlite insert failed: local database is unavailable or invalid: %w", err)
+		}
 		return fmt.Errorf("%s insert failed: database connection may be unavailable: %w", s.dbType, err)
 	}
 	return nil
 }
 
 func (s *sqlStore) DeleteOldVisits(retentionDays int) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.dbType == "sqlite" {
+		if err := s.ensureSQLitePresentLocked(); err != nil {
+			return 0, fmt.Errorf("sqlite cleanup failed while preparing local database: %w", err)
+		}
+	}
+
 	cutoff := time.Now().UTC().AddDate(0, 0, -retentionDays).Unix()
 	var q string
 	if s.dbType == "postgres" {
@@ -536,13 +587,79 @@ func (s *sqlStore) DeleteOldVisits(retentionDays int) (int64, error) {
 		q = `DELETE FROM visits WHERE timestamp < ?`
 	}
 	res, err := s.db.Exec(q, cutoff)
+	if err == nil {
+		return res.RowsAffected()
+	}
+
+	if s.dbType == "sqlite" && shouldRecoverSQLite(err) {
+		log.Printf("[store] sqlite cleanup failed due to missing or incomplete database, attempting recovery: %v", err)
+		if recoverErr := s.reopenSQLiteLocked(); recoverErr != nil {
+			return 0, fmt.Errorf("sqlite cleanup failed after recovery attempt: %w", recoverErr)
+		}
+		res, err = s.db.Exec(q, cutoff)
+		if err == nil {
+			log.Printf("[store] sqlite database recovered and cleanup retried successfully")
+			return res.RowsAffected()
+		}
+		return 0, fmt.Errorf("sqlite cleanup failed after recovery retry: %w", err)
+	}
+
 	if err != nil {
+		if s.dbType == "sqlite" {
+			return 0, fmt.Errorf("sqlite cleanup failed: local database is unavailable or invalid: %w", err)
+		}
 		return 0, fmt.Errorf("%s cleanup failed: database connection may be unavailable: %w", s.dbType, err)
 	}
 	return res.RowsAffected()
 }
 
-func (s *sqlStore) Close() error { return s.db.Close() }
+func (s *sqlStore) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.db.Close()
+}
+
+func shouldRecoverSQLite(err error) bool {
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "no such table: visits") ||
+		strings.Contains(msg, "unable to open database file") ||
+		strings.Contains(msg, "file is not a database")
+}
+
+func (s *sqlStore) reopenSQLiteLocked() error {
+	if s.dbType != "sqlite" {
+		return fmt.Errorf("sqlite recovery requested for non-sqlite store")
+	}
+	if err := s.db.Close(); err != nil {
+		log.Printf("[store] sqlite close during recovery returned: %v", err)
+	}
+	db, err := openSQLDB("sqlite", s.dsn)
+	if err != nil {
+		return err
+	}
+	s.db = db
+	return nil
+}
+
+func (s *sqlStore) ensureSQLitePresentLocked() error {
+	if s.dbType != "sqlite" {
+		return nil
+	}
+	now := time.Now()
+	if !s.lastSQLiteExistenceCheck.IsZero() && now.Sub(s.lastSQLiteExistenceCheck) < sqliteExistenceCheckInterval {
+		return nil
+	}
+	s.lastSQLiteExistenceCheck = now
+
+	if _, err := os.Stat(s.dsn); err == nil {
+		return nil
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+
+	log.Printf("[store] sqlite database file missing, recreating %s", s.dsn)
+	return s.reopenSQLiteLocked()
+}
 
 // ---------------------------------------------------------------------------
 // CSV store

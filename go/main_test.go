@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestRealIPIgnoresForwardedHeadersFromUntrustedClients(t *testing.T) {
@@ -102,5 +103,44 @@ func TestJSONStoreRecreatesMissingFileOnInsert(t *testing.T) {
 	text := string(data)
 	if !strings.Contains(text, `"unique_id":"u1"`) {
 		t.Fatalf("json row missing from recreated file: %q", text)
+	}
+}
+
+func TestSQLiteStoreRecoversWhenDatabaseFileIsDeleted(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "visits.db")
+
+	store, err := newSQLStore("sqlite", path)
+	if err != nil {
+		t.Fatalf("newSQLStore(): %v", err)
+	}
+	defer store.Close()
+
+	if err := store.InsertVisit("u1", "US", "", "/before-delete", "Direct"); err != nil {
+		t.Fatalf("initial InsertVisit(): %v", err)
+	}
+
+	if err := os.Remove(path); err != nil {
+		t.Fatalf("remove sqlite db: %v", err)
+	}
+
+	time.Sleep(sqliteExistenceCheckInterval + 100*time.Millisecond)
+
+	if err := store.InsertVisit("u2", "US", "", "/after-delete", "Direct"); err != nil {
+		t.Fatalf("InsertVisit() after delete: %v", err)
+	}
+
+	reopened, err := newSQLStore("sqlite", path)
+	if err != nil {
+		t.Fatalf("reopen sqlite store: %v", err)
+	}
+	defer reopened.Close()
+
+	var count int
+	if err := reopened.db.QueryRow(`SELECT COUNT(*) FROM visits WHERE unique_id = ?`, "u2").Scan(&count); err != nil {
+		t.Fatalf("query recovered row: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("recovered row count = %d, want 1", count)
 	}
 }
