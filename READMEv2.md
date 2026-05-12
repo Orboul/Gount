@@ -95,3 +95,7 @@ https://yoursite.com/landing?ref=partner-acme
 ```
 
 If someone arrives without a `?ref=` and without a browser Referer header, the referrer is stored as `Direct`.
+
+## Reverse proxy note
+
+`X-Forwarded-For` and `X-Real-IP` are only used when the request comes from a configured `trusted_proxies` IP or CIDR. If `trusted_proxies` is empty, gount ignores proxy headers and uses the direct socket address.

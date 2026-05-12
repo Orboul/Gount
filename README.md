@@ -13,7 +13,7 @@ A lightweight, self-hosted, privacy-first page-view tracker written in Go.
 
 The tracker exposes a single endpoint, `GET /t`. You embed it in your pages as either a tracking pixel or a JS `fetch`. When a request arrives the binary:
 
-1. Extracts the real client IP (honours `X-Forwarded-For` / `X-Real-IP` from reverse proxies)
+1. Extracts the real client IP (honours `X-Forwarded-For` / `X-Real-IP` only from configured trusted proxies)
 2. Derives a pseudonymous user ID: `SHA-256(ip | userAgent | secret_salt)`
 3. Resolves the visitor's country (and optionally city) from the local GeoLite2 DB
 4. Writes one row to the configured store
@@ -60,6 +60,11 @@ All settings live in `config.yaml` next to the binary. You can also pass an expl
 ### Full annotated config
 
 ```yaml
+# IP address the tracker binds to.
+# Leave blank (or "0.0.0.0") to listen on all interfaces.
+# Set to "127.0.0.1" to accept only local connections.
+server_ip: ""
+
 # TCP port the HTTP server listens on.
 server_port: 8080
 
@@ -67,6 +72,14 @@ server_port: 8080
 # Treat this like a password — change it before deploying.
 # Generate one with: openssl rand -hex 32
 secret_salt: "CHANGE_ME_use_openssl_rand_hex_32"
+
+# Reverse proxies allowed to supply X-Forwarded-For / X-Real-IP.
+# Add exact IPs or CIDR ranges, for example:
+#   - "127.0.0.1/32"
+#   - "::1/128"
+#   - "10.0.0.0/8"
+# Leave empty to ignore proxy headers entirely.
+trusted_proxies: []
 
 # ── Storage ──────────────────────────────────────────────────────────────────
 
@@ -127,6 +140,7 @@ The `visits` table / file schema is the same across all backends:
 | `country` | string | ISO 3166-1 alpha-2 code, e.g. `US` |
 | `city` | string | City name (empty unless `geo_type: city`) |
 | `path` | string | Page path or URL |
+| `referrer` | string | Explicit `ref` value, referrer host, or `Direct` |
 | `timestamp` | integer | Unix seconds (UTC) |
 
 ---
@@ -144,7 +158,7 @@ Drop a 1×1 transparent image tag at the bottom of your `<body>`. The browser ma
      width="1" height="1" style="display:none" alt="">
 ```
 
-Replace `/your-page-path` with the page identifier you want recorded — or omit the `?p=` parameter and the tracker will fall back to the HTTP `Referer` header.
+Replace `/your-page-path` with the page identifier you want recorded. If you omit `?p=`, gount stores `/`.
 
 ### Option B — JavaScript fetch (fires after page load)
 
@@ -168,26 +182,42 @@ Use both: the JS version fires when scripts are allowed, the pixel fires when th
 
 ```html
 <script>
-  fetch('https://tracker.example.com/t?p=' + encodeURIComponent(location.pathname));
+  fetch('https://tracker.example.com/t?p=' + encodeURIComponent(location.pathname), {
+    method: 'GET',
+    keepalive: true
+  });
 </script>
 <noscript>
-  <img src="https://tracker.example.com/t" width="1" height="1" style="display:none" alt="">
+  <img src="https://tracker.example.com/t?p=/landing-page" width="1" height="1" style="display:none" alt="">
 </noscript>
 ```
 
-### The `p` query parameter
+### The `p` and `ref` query parameters
 
 | Scenario | What gets recorded |
 |---|---|
 | `?p=/blog/post-1` | `/blog/post-1` |
-| No `?p=`, `Referer` header present | Full referrer URL |
+| No `?p=` | `/` |
+| `?ref=newsletter` | `newsletter` |
+| No `?ref=`, `Referer` header present | Referrer host only, e.g. `google.com` |
 | Neither | `/` |
 
 ---
 
 ## Running behind a reverse proxy
 
-gount reads `X-Forwarded-For` and `X-Real-IP` to get the real client IP. Make sure your proxy sets one of these headers.
+gount only trusts `X-Forwarded-For` and `X-Real-IP` when the incoming socket address matches one of the `trusted_proxies` entries in `config.yaml`. This prevents direct clients from spoofing their IP.
+
+Example:
+
+```yaml
+trusted_proxies:
+  - "127.0.0.1/32"
+  - "::1/128"
+  - "10.0.0.0/8"
+```
+
+Then make sure your proxy sets one of the forwarding headers.
 
 **nginx:**
 ```nginx
@@ -222,12 +252,13 @@ MaxMind updates GeoLite2 every Tuesday. The `update_frequency_days` config value
 
 ## Building from source
 
-Requires Go 1.22+.
+Requires Go 1.24 or newer.
 
 ```bash
 git clone https://github.com/youruser/gount
 cd gount
-go build -o gount .
+cd go
+go build -o ../gount .
 ```
 
 To cross-compile for all platforms at once:

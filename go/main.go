@@ -41,10 +41,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/oschwald/geoip2-golang"
-	"gopkg.in/yaml.v3"
 	_ "github.com/go-sql-driver/mysql"
 	_ "github.com/lib/pq"
+	"github.com/oschwald/geoip2-golang"
+	"gopkg.in/yaml.v3"
 	_ "modernc.org/sqlite"
 )
 
@@ -56,6 +56,9 @@ type Config struct {
 	ServerPort int    `yaml:"server_port"`
 	ServerIP   string `yaml:"server_ip"`
 	SecretSalt string `yaml:"secret_salt"`
+	// TrustedProxies lists IPs or CIDR ranges whose forwarding headers should
+	// be trusted when resolving the real client IP. Empty means trust none.
+	TrustedProxies []string `yaml:"trusted_proxies"`
 
 	// DBType selects the storage backend: sqlite, postgres, mysql, csv, json
 	DBType string `yaml:"db_type"`
@@ -87,6 +90,14 @@ server_port: 8080
 # CHANGE THIS before deploying — treat it like a password.
 # Generate a good value with: openssl rand -hex 32
 secret_salt: "CHANGE_ME_use_openssl_rand_hex_32"
+
+# Reverse proxies allowed to supply X-Forwarded-For / X-Real-IP.
+# Add exact IPs or CIDR ranges, for example:
+#   - "127.0.0.1/32"
+#   - "::1/128"
+#   - "10.0.0.0/8"
+# Leave empty to ignore proxy headers entirely.
+trusted_proxies: []
 
 # Storage backend: sqlite | postgres | mysql | csv | json
 db_type: "sqlite"
@@ -687,18 +698,16 @@ func startCleanupWorker(store Store, retentionDays int, done <-chan struct{}) {
 // IP extraction
 // ---------------------------------------------------------------------------
 
-func realIP(r *http.Request) string {
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		parts := strings.Split(xff, ",")
-		ip := strings.TrimSpace(parts[0])
-		if net.ParseIP(ip) != nil {
+func realIP(r *http.Request, trusted []*net.IPNet) string {
+	if isTrustedProxy(remoteIP(r), trusted) {
+		if ip := ipFromForwardedHeader(r.Header.Get("X-Forwarded-For")); ip != "" {
 			return ip
 		}
-	}
-	if xri := r.Header.Get("X-Real-IP"); xri != "" {
-		ip := strings.TrimSpace(xri)
-		if net.ParseIP(ip) != nil {
-			return ip
+		if xri := r.Header.Get("X-Real-IP"); xri != "" {
+			ip := strings.TrimSpace(xri)
+			if net.ParseIP(ip) != nil {
+				return ip
+			}
 		}
 	}
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
@@ -752,9 +761,10 @@ func geoLookup(geoDB *geoip2.Reader, ipStr, geoType string) (country, city strin
 // ---------------------------------------------------------------------------
 
 type App struct {
-	cfg   *Config
-	store Store
-	geoDB *geoip2.Reader
+	cfg            *Config
+	store          Store
+	geoDB          *geoip2.Reader
+	trustedProxies []*net.IPNet
 }
 
 func (a *App) trackHandler(w http.ResponseWriter, r *http.Request) {
@@ -768,7 +778,7 @@ func (a *App) trackHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ip := realIP(r)
+	ip := realIP(r, a.trustedProxies)
 	ua := r.UserAgent()
 
 	path := r.URL.Query().Get("p")
@@ -803,6 +813,71 @@ func healthHandler(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintln(w, "ok")
 }
 
+func parseTrustedProxies(entries []string) ([]*net.IPNet, error) {
+	proxies := make([]*net.IPNet, 0, len(entries))
+	for _, entry := range entries {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		if strings.Contains(entry, "/") {
+			_, network, err := net.ParseCIDR(entry)
+			if err != nil {
+				return nil, fmt.Errorf("invalid trusted proxy CIDR %q: %w", entry, err)
+			}
+			proxies = append(proxies, network)
+			continue
+		}
+		ip := net.ParseIP(entry)
+		if ip == nil {
+			return nil, fmt.Errorf("invalid trusted proxy IP %q", entry)
+		}
+		bits := 128
+		if ip.To4() != nil {
+			ip = ip.To4()
+			bits = 32
+		}
+		proxies = append(proxies, &net.IPNet{
+			IP:   ip,
+			Mask: net.CIDRMask(bits, bits),
+		})
+	}
+	return proxies, nil
+}
+
+func remoteIP(r *http.Request) net.IP {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
+	return net.ParseIP(strings.TrimSpace(host))
+}
+
+func ipFromForwardedHeader(xff string) string {
+	if xff == "" {
+		return ""
+	}
+	for _, part := range strings.Split(xff, ",") {
+		ip := strings.TrimSpace(part)
+		if net.ParseIP(ip) != nil {
+			return ip
+		}
+	}
+	return ""
+}
+
+func isTrustedProxy(ip net.IP, trusted []*net.IPNet) bool {
+	if ip == nil {
+		return false
+	}
+	for _, network := range trusted {
+		if network.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
@@ -831,6 +906,11 @@ func main() {
 	}
 	log.Printf("[init] config loaded from %s", configPath)
 
+	trustedProxies, err := parseTrustedProxies(cfg.TrustedProxies)
+	if err != nil {
+		log.Fatalf("trusted proxies: %v", err)
+	}
+
 	// Resolve geodb path.
 	if cfg.GeoDBPath == "" {
 		cfg.GeoDBPath = filepath.Join(dir, "data", "geodata", geoEdition(cfg.GeoType)+".mmdb")
@@ -845,6 +925,7 @@ func main() {
 	log.Printf("[init] db type:    %s", cfg.DBType)
 	log.Printf("[init] geo type:   %s", cfg.GeoType)
 	log.Printf("[init] geodb path: %s", cfg.GeoDBPath)
+	log.Printf("[init] trusted proxies: %d", len(trustedProxies))
 	log.Printf("[init] geo-DB update reminder: every %d day(s)", cfg.UpdateFrequencyDays)
 
 	// GeoLite2: download if missing.
@@ -874,7 +955,7 @@ func main() {
 	startCleanupWorker(store, cfg.RetentionDays, done)
 
 	// HTTP routes.
-	app := &App{cfg: cfg, store: store, geoDB: geoDB}
+	app := &App{cfg: cfg, store: store, geoDB: geoDB, trustedProxies: trustedProxies}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/t", app.trackHandler)
 	mux.HandleFunc("/health", healthHandler)

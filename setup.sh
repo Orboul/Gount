@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # ─── Config ───────────────────────────────────────────────────────────────────
-REQUIRED="1.22.0"
+REQUIRED="1.24.0"
 REPO="https://github.com/Orboul/Gount.git"
 INSTALL_DIR="$(pwd)/gount"
 SERVICE_NAME="gount"
@@ -189,6 +189,14 @@ server_port: 8080
 # Note: changing this will make all existing visitor IDs unresolvable.
 secret_salt: "$salt"
 
+# Reverse proxies allowed to supply X-Forwarded-For / X-Real-IP.
+# Add exact IPs or CIDR ranges, for example:
+#   - "127.0.0.1/32"
+#   - "::1/128"
+#   - "10.0.0.0/8"
+# Leave empty to ignore proxy headers entirely.
+trusted_proxies: []
+
 # Storage backend: sqlite | postgres | mysql | csv | json
 db_type: "$db_type"
 
@@ -291,6 +299,7 @@ All settings live in `config.yaml` next to the binary.
 | `server_ip` | *(blank = all)* | IP address to bind to (`127.0.0.1` for local only) |
 | `server_port` | `8080` | Port the tracker listens on |
 | `secret_salt` | *(generated)* | Salt for hashing visitor IDs — treat like a password |
+| `trusted_proxies` | `[]` | IPs/CIDRs allowed to supply `X-Forwarded-For` / `X-Real-IP` |
 | `db_type` | `sqlite` | Storage backend: `sqlite`, `postgres`, `mysql`, `csv`, `json` |
 | `db_dsn` | *(empty)* | Connection string for postgres/mysql |
 | `geo_type` | `country` | `country` (lightweight) or `city` (more storage + CPU) |
@@ -305,6 +314,16 @@ openssl rand -hex 32
 ```
 
 Replace `secret_salt` in `config.yaml` and restart. Note: existing visitor IDs will no longer match after rotation.
+
+### Reverse proxies
+
+gount ignores `X-Forwarded-For` and `X-Real-IP` unless the request comes from a configured `trusted_proxies` IP or CIDR. Example:
+
+```yaml
+trusted_proxies:
+  - "127.0.0.1/32"
+  - "::1/128"
+```
 
 ### Refreshing the geo database
 
@@ -383,7 +402,7 @@ cleanup_source() {
 # ─── Entry point ──────────────────────────────────────────────────────────────
 main() {
     echo -e "${BOLD}"
-    echo "  ██████╗  ██████╗ ██╗   ██╗███╗   ██╗████████╗"
+    echo "   ██████╗  ██████╗ ██╗   ██╗███╗   ██╗████████╗"
     echo "  ██╔════╝ ██╔═══██╗██║   ██║████╗  ██║╚══██╔══╝"
     echo "  ██║  ███╗██║   ██║██║   ██║██╔██╗ ██║   ██║"
     echo "  ██║   ██║██║   ██║██║   ██║██║╚██╗██║   ██║"

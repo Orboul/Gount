@@ -14,8 +14,28 @@ server_port: 8080
 # Generate a good value with: openssl rand -hex 32
 secret_salt: "CHANGE_ME_use_openssl_rand_hex_32"
 
-# Path to the SQLite database file (relative to the binary directory).
-db_path: "data/visits.db"
+# Reverse proxies allowed to supply X-Forwarded-For / X-Real-IP.
+# Add exact IPs or CIDR ranges, for example:
+#   - "127.0.0.1/32"
+#   - "::1/128"
+#   - "10.0.0.0/8"
+# Leave empty to ignore proxy headers entirely.
+trusted_proxies: []
+
+# Storage backend: sqlite | postgres | mysql | csv | json
+db_type: "sqlite"
+
+# For sqlite, csv, json — path to the data file (relative to binary dir).
+# Leave blank for the default:
+#   sqlite -> data/visits.db
+#   csv    -> data/visits.csv
+#   json   -> data/visits.jsonl
+db_path: ""
+
+# For postgres / mysql — full DSN connection string.
+# postgres example: postgres://user:pass@localhost:5432/gount?sslmode=disable
+# mysql example:    user:pass@tcp(localhost:3306)/gount?parseTime=true
+db_dsn: ""
 
 # GeoLite2 edition to use: "country" (smaller, faster) or "city" (includes city name).
 # This also controls which edition is auto-downloaded.
