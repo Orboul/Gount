@@ -1,0 +1,31 @@
+# apkount configuration
+# -------------------------------------------------------------------
+
+# TCP port the tracker listens on.
+server_port: 8080
+
+# Secret salt mixed into the SHA-256 User ID hash.
+# CHANGE THIS before deploying — treat it like a password.
+# Generate a good value with: openssl rand -hex 32
+secret_salt: "CHANGE_ME_use_openssl_rand_hex_32"
+
+# Path to the SQLite database file (relative to the binary directory).
+db_path: "data/visits.db"
+
+# GeoLite2 edition to use: "country" (smaller, faster) or "city" (includes city name).
+# This also controls which edition is auto-downloaded.
+geo_type: "country"
+
+# Path to the MaxMind GeoLite2 .mmdb file (relative to the binary directory).
+# Leave blank to use the default derived from geo_type:
+#   data/geodata/GeoLite2-Country.mmdb  (when geo_type: country)
+#   data/geodata/GeoLite2-City.mmdb     (when geo_type: city)
+geodb_path: ""
+
+# Number of days to retain visit records.
+# The background worker deletes rows older than this every 24 hours.
+retention_days: 90
+
+# Metadata only — reminds the operator how often to refresh the GeoLite2 DB.
+# MaxMind updates GeoLite2 every Tuesday; bi-weekly is a sensible cadence.
+update_frequency_days: 14
