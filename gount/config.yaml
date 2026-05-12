@@ -1,0 +1,37 @@
+# gount configuration
+# -------------------------------------------------------------------
+
+# TCP port the tracker listens on.
+server_port: 8080
+
+# Secret salt mixed into the SHA-256 User ID hash.
+# Pre-generated — change it if you want a fresh one:
+#   openssl rand -hex 32
+secret_salt: "7d2c42aaa1b9679fd087b1784260b47875d6f48cc711ab316e913606cc203c8f"
+
+# Storage backend: sqlite | postgres | mysql | csv | json
+db_type: "csv"
+
+# For sqlite/csv/json — path to the data file (relative to the binary).
+# Leave blank to use the default (data/visits.db, etc.).
+db_path: ""
+
+# For postgres/mysql — fill in your connection string below.
+# postgres: postgres://user:pass@localhost:5432/gount?sslmode=disable
+# mysql:    user:pass@tcp(localhost:3306)/gount?parseTime=true
+db_dsn: ""
+
+# GeoLite2 edition: "country" (ISO code only) or "city" (adds city name).
+# city uses more storage and CPU — auto-downloaded on first run.
+geo_type: "country"
+
+# Path to the GeoLite2 .mmdb file (relative to the binary).
+# Leave blank for the default derived from geo_type.
+geodb_path: ""
+
+# Delete visit records older than this many days (cleanup runs every 24 h).
+retention_days: 90
+
+# How often (in days) to remind you to refresh the GeoLite2 DB.
+# MaxMind updates it weekly — bi-weekly is a sensible cadence.
+update_frequency_days: 14
