@@ -1,13 +1,18 @@
 # gount configuration
 # -------------------------------------------------------------------
 
+# IP address the tracker binds to.
+# Leave blank (or "0.0.0.0") to listen on all interfaces.
+# Set to "127.0.0.1" to accept only local connections.
+server_ip: "0.0.0.0"
+
 # TCP port the tracker listens on.
 server_port: 8080
 
-# Secret salt mixed into the SHA-256 User ID hash.
-# Pre-generated — change it if you want a fresh one:
-#   openssl rand -hex 32
-secret_salt: "7d2c42aaa1b9679fd087b1784260b47875d6f48cc711ab316e913606cc203c8f"
+# Secret salt used to hash visitor IDs — generated automatically by setup.
+# To rotate: replace with a new value from: openssl rand -hex 32
+# Note: changing this will make all existing visitor IDs unresolvable.
+secret_salt: "1c449fb8e874baca56f99f7c6c1f863fae56563c9b0851ad919ecdb39b98252d"
 
 # Storage backend: sqlite | postgres | mysql | csv | json
 db_type: "csv"
@@ -22,7 +27,7 @@ db_path: ""
 db_dsn: ""
 
 # GeoLite2 edition: "country" (ISO code only) or "city" (adds city name).
-# city uses more storage and CPU — auto-downloaded on first run.
+# city uses more storage and CPU — the right edition is auto-downloaded on first run.
 geo_type: "country"
 
 # Path to the GeoLite2 .mmdb file (relative to the binary).

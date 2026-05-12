@@ -56,6 +56,7 @@ All settings live in `config.yaml` next to the binary.
 
 | Option | Default | Description |
 |---|---|---|
+| `server_ip` | *(blank = all)* | IP address to bind to (`127.0.0.1` for local only) |
 | `server_port` | `8080` | Port the tracker listens on |
 | `secret_salt` | *(generated)* | Salt for hashing visitor IDs — treat like a password |
 | `db_type` | `sqlite` | Storage backend: `sqlite`, `postgres`, `mysql`, `csv`, `json` |

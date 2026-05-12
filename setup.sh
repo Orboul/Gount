@@ -74,6 +74,25 @@ write_config() {
 
     step "Configuration"
 
+    # ── Bind IP ──
+    echo
+    label "Bind IP address"
+    ask "Which IP address should gount listen on?"
+    ask "Leave blank to listen on all interfaces (0.0.0.0)."
+    ask "Enter 127.0.0.1 to accept only local connections."
+    echo
+    read -rp "  IP address [default: all interfaces]: " server_ip_input
+    local server_ip="${server_ip_input:-}"
+    if [[ -n "$server_ip" ]] && ! [[ "$server_ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$|^::1$|^[0-9a-fA-F:]+$ ]]; then
+        warn "Value doesn't look like a valid IP — using blank (all interfaces)."
+        server_ip=""
+    fi
+    if [[ -z "$server_ip" ]]; then
+        info "Bind IP: all interfaces (0.0.0.0)"
+    else
+        info "Bind IP: $server_ip"
+    fi
+
     # ── Storage backend ──
     echo
     label "Storage backend"
@@ -156,6 +175,11 @@ write_config() {
     tee "$config_path" > /dev/null <<EOF
 # gount configuration
 # -------------------------------------------------------------------
+
+# IP address the tracker binds to.
+# Leave blank (or "0.0.0.0") to listen on all interfaces.
+# Set to "127.0.0.1" to accept only local connections.
+server_ip: "$server_ip"
 
 # TCP port the tracker listens on.
 server_port: 8080
@@ -264,6 +288,7 @@ All settings live in `config.yaml` next to the binary.
 
 | Option | Default | Description |
 |---|---|---|
+| `server_ip` | *(blank = all)* | IP address to bind to (`127.0.0.1` for local only) |
 | `server_port` | `8080` | Port the tracker listens on |
 | `secret_salt` | *(generated)* | Salt for hashing visitor IDs — treat like a password |
 | `db_type` | `sqlite` | Storage backend: `sqlite`, `postgres`, `mysql`, `csv`, `json` |

@@ -1,6 +1,11 @@
 # gount configuration
 # -------------------------------------------------------------------
 
+# IP address the tracker binds to.
+# Leave blank (or "0.0.0.0") to listen on all interfaces.
+# Set to "127.0.0.1" to accept only local connections.
+server_ip: ""
+
 # TCP port the tracker listens on.
 server_port: 8080
 

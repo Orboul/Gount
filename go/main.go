@@ -54,6 +54,7 @@ import (
 
 type Config struct {
 	ServerPort int    `yaml:"server_port"`
+	ServerIP   string `yaml:"server_ip"`
 	SecretSalt string `yaml:"secret_salt"`
 
 	// DBType selects the storage backend: sqlite, postgres, mysql, csv, json
@@ -73,6 +74,11 @@ type Config struct {
 
 const defaultConfigYAML = `# gount configuration
 # -------------------------------------------------------------------
+
+# IP address the tracker binds to.
+# Leave blank (or "0.0.0.0") to listen on all interfaces.
+# Set to "127.0.0.1" to accept only local connections.
+server_ip: ""
 
 # TCP port the tracker listens on.
 server_port: 8080
@@ -873,7 +879,7 @@ func main() {
 	mux.HandleFunc("/t", app.trackHandler)
 	mux.HandleFunc("/health", healthHandler)
 
-	addr := fmt.Sprintf(":%d", cfg.ServerPort)
+	addr := fmt.Sprintf("%s:%d", cfg.ServerIP, cfg.ServerPort)
 	srv := &http.Server{
 		Addr:         addr,
 		Handler:      mux,
@@ -882,7 +888,11 @@ func main() {
 		IdleTimeout:  30 * time.Second,
 	}
 
-	log.Printf("[init] listening on %s", addr)
+	logIP := cfg.ServerIP
+	if logIP == "" || logIP == "0.0.0.0" {
+		logIP = "0.0.0.0"
+	}
+	log.Printf("[init] listening on %s:%d", logIP, cfg.ServerPort)
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("server: %v", err)
 	}
