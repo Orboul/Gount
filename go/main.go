@@ -56,6 +56,7 @@ type Config struct {
 	ServerPort int    `yaml:"server_port"`
 	ServerIP   string `yaml:"server_ip"`
 	SecretSalt string `yaml:"secret_salt"`
+	LogPath    string `yaml:"log_path"`
 	// TrustedProxies lists IPs or CIDR ranges whose forwarding headers should
 	// be trusted when resolving the real client IP. Empty means trust none.
 	TrustedProxies []string `yaml:"trusted_proxies"`
@@ -90,6 +91,11 @@ server_port: 8080
 # CHANGE THIS before deploying — treat it like a password.
 # Generate a good value with: openssl rand -hex 32
 secret_salt: "CHANGE_ME_use_openssl_rand_hex_32"
+
+# Path to the JSONL log file (relative to the binary).
+# Leave blank for the default:
+#   data/logs/gount.jsonl
+log_path: ""
 
 # Reverse proxies allowed to supply X-Forwarded-For / X-Real-IP.
 # Add exact IPs or CIDR ranges, for example:
@@ -196,6 +202,65 @@ func resolveFromBinary(binDir, p string) string {
 }
 
 // ---------------------------------------------------------------------------
+// Logging
+// ---------------------------------------------------------------------------
+
+type jsonLogWriter struct {
+	mu   sync.Mutex
+	file *os.File
+}
+
+type logEntry struct {
+	Timestamp string `json:"timestamp"`
+	Message   string `json:"message"`
+}
+
+func newJSONLLogWriter(path string) (*jsonLogWriter, error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return nil, fmt.Errorf("create log dir: %w", err)
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		return nil, fmt.Errorf("open log file: %w", err)
+	}
+	return &jsonLogWriter{file: f}, nil
+}
+
+func (w *jsonLogWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	entry := logEntry{
+		Timestamp: time.Now().UTC().Format(time.RFC3339Nano),
+		Message:   strings.TrimRight(string(p), "\n"),
+	}
+	line, err := json.Marshal(entry)
+	if err != nil {
+		return 0, err
+	}
+	line = append(line, '\n')
+	if _, err := w.file.Write(line); err != nil {
+		return 0, err
+	}
+	return len(p), nil
+}
+
+func (w *jsonLogWriter) Close() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.file.Close()
+}
+
+func initLogger(path string) (io.Closer, error) {
+	writer, err := newJSONLLogWriter(path)
+	if err != nil {
+		return nil, err
+	}
+	log.SetOutput(io.MultiWriter(os.Stderr, writer))
+	return writer, nil
+}
+
+// ---------------------------------------------------------------------------
 // GeoLite2 auto-download
 // ---------------------------------------------------------------------------
 
@@ -232,29 +297,78 @@ func ensureGeoDB(destPath, geoType string) error {
 			log.Printf("[geodb] source failed, trying next: %v", lastErr)
 			continue
 		}
-		defer resp.Body.Close()
 
 		if resp.StatusCode != http.StatusOK {
 			lastErr = fmt.Errorf("download %s from %s: server returned %s", edition, base, resp.Status)
 			log.Printf("[geodb] source failed, trying next: %v", lastErr)
+			_ = resp.Body.Close()
 			continue
 		}
 
-		out, err := os.Create(destPath)
+		tmpPath := destPath + ".download"
+		out, err := os.Create(tmpPath)
 		if err != nil {
-			return fmt.Errorf("create %s: %w", destPath, err)
+			_ = resp.Body.Close()
+			return fmt.Errorf("create %s: %w", tmpPath, err)
 		}
-		defer out.Close()
 
 		if _, err := io.Copy(out, resp.Body); err != nil {
-			_ = os.Remove(destPath)
-			return fmt.Errorf("write %s: %w", destPath, err)
+			_ = out.Close()
+			_ = resp.Body.Close()
+			_ = os.Remove(tmpPath)
+			return fmt.Errorf("write %s: %w", tmpPath, err)
+		}
+		if err := out.Close(); err != nil {
+			_ = resp.Body.Close()
+			_ = os.Remove(tmpPath)
+			return fmt.Errorf("close %s: %w", tmpPath, err)
+		}
+		_ = resp.Body.Close()
+
+		testDB, err := geoip2.Open(tmpPath)
+		if err != nil {
+			_ = os.Remove(tmpPath)
+			lastErr = fmt.Errorf("downloaded %s is invalid: %w", tmpPath, err)
+			log.Printf("[geodb] source failed, trying next: %v", lastErr)
+			continue
+		}
+		_ = testDB.Close()
+
+		if err := os.Rename(tmpPath, destPath); err != nil {
+			_ = os.Remove(tmpPath)
+			return fmt.Errorf("activate %s: %w", destPath, err)
 		}
 
 		log.Printf("[geodb] %s.mmdb saved to %s", edition, destPath)
 		return nil
 	}
 	return lastErr
+}
+
+func openGeoDBWithRecovery(destPath, geoType string) (*geoip2.Reader, error) {
+	if err := ensureGeoDB(destPath, geoType); err != nil {
+		return nil, err
+	}
+
+	geoDB, err := geoip2.Open(destPath)
+	if err == nil {
+		return geoDB, nil
+	}
+
+	log.Printf("[geodb] existing database is invalid or unreadable, redownloading: %v", err)
+	if removeErr := os.Remove(destPath); removeErr != nil && !os.IsNotExist(removeErr) {
+		return nil, fmt.Errorf("remove invalid geodb %s: %w", destPath, removeErr)
+	}
+
+	if err := ensureGeoDB(destPath, geoType); err != nil {
+		return nil, fmt.Errorf("redownload geodb: %w", err)
+	}
+
+	geoDB, err = geoip2.Open(destPath)
+	if err != nil {
+		return nil, fmt.Errorf("open redownloaded geodb: %w", err)
+	}
+	return geoDB, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -407,7 +521,10 @@ func (s *sqlStore) InsertVisit(uniqueID, country, city, path, referrer string) e
 		q = `INSERT INTO visits (unique_id, country, city, path, referrer, timestamp) VALUES (?, ?, ?, ?, ?, ?)`
 	}
 	_, err := s.db.Exec(q, uniqueID, country, city, path, referrer, time.Now().UTC().Unix())
-	return err
+	if err != nil {
+		return fmt.Errorf("%s insert failed: database connection may be unavailable: %w", s.dbType, err)
+	}
+	return nil
 }
 
 func (s *sqlStore) DeleteOldVisits(retentionDays int) (int64, error) {
@@ -420,7 +537,7 @@ func (s *sqlStore) DeleteOldVisits(retentionDays int) (int64, error) {
 	}
 	res, err := s.db.Exec(q, cutoff)
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("%s cleanup failed: database connection may be unavailable: %w", s.dbType, err)
 	}
 	return res.RowsAffected()
 }
@@ -438,38 +555,66 @@ type csvStore struct {
 
 var csvHeader = []string{"unique_id", "country", "city", "path", "timestamp", "referrer"}
 
-func newCSVStore(path string) (*csvStore, error) {
+func ensureCSVFile(path string) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return nil, fmt.Errorf("create csv dir: %w", err)
+		return fmt.Errorf("create csv dir: %w", err)
 	}
 
-	// Write header only if the file is new / empty.
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
-		return nil, fmt.Errorf("open csv: %w", err)
+		return fmt.Errorf("open csv: %w", err)
 	}
 	defer f.Close()
 
 	info, err := f.Stat()
 	if err != nil {
-		return nil, err
+		return err
 	}
-	if info.Size() == 0 {
-		w := csv.NewWriter(f)
-		if err := w.Write(csvHeader); err != nil {
-			return nil, fmt.Errorf("write csv header: %w", err)
-		}
-		w.Flush()
+	if info.Size() > 0 {
+		return nil
+	}
+
+	w := csv.NewWriter(f)
+	if err := w.Write(csvHeader); err != nil {
+		return fmt.Errorf("write csv header: %w", err)
+	}
+	w.Flush()
+	return w.Error()
+}
+
+func newCSVStore(path string) (*csvStore, error) {
+	if err := ensureCSVFile(path); err != nil {
+		return nil, err
 	}
 
 	return &csvStore{path: path}, nil
+}
+
+func (s *csvStore) ensureFile() error {
+	info, err := os.Stat(s.path)
+	switch {
+	case err == nil && info.Size() > 0:
+		return nil
+	case err == nil || os.IsNotExist(err):
+		if recreateErr := ensureCSVFile(s.path); recreateErr != nil {
+			return recreateErr
+		}
+		log.Printf("[store] csv visit file missing or empty, recreated %s", s.path)
+		return nil
+	default:
+		return err
+	}
 }
 
 func (s *csvStore) InsertVisit(uniqueID, country, city, path, referrer string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	f, err := os.OpenFile(s.path, os.O_APPEND|os.O_WRONLY, 0o644)
+	if err := s.ensureFile(); err != nil {
+		return err
+	}
+
+	f, err := os.OpenFile(s.path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
 	if err != nil {
 		return err
 	}
@@ -490,6 +635,10 @@ func (s *csvStore) DeleteOldVisits(retentionDays int) (int64, error) {
 	defer s.mu.Unlock()
 
 	cutoff := time.Now().UTC().AddDate(0, 0, -retentionDays).Unix()
+
+	if err := s.ensureFile(); err != nil {
+		return 0, err
+	}
 
 	f, err := os.Open(s.path)
 	if err != nil {
@@ -541,24 +690,49 @@ type jsonStore struct {
 	path string
 }
 
-func newJSONStore(path string) (*jsonStore, error) {
+func ensureJSONFile(path string) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return nil, fmt.Errorf("create json dir: %w", err)
+		return fmt.Errorf("create json dir: %w", err)
 	}
 	// Touch the file so it exists.
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDONLY, 0o644)
 	if err != nil {
-		return nil, fmt.Errorf("open jsonl: %w", err)
+		return fmt.Errorf("open jsonl: %w", err)
 	}
 	f.Close()
+	return nil
+}
+
+func newJSONStore(path string) (*jsonStore, error) {
+	if err := ensureJSONFile(path); err != nil {
+		return nil, err
+	}
 	return &jsonStore{path: path}, nil
+}
+
+func (s *jsonStore) ensureFile() error {
+	if _, err := os.Stat(s.path); err == nil {
+		return nil
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+
+	if err := ensureJSONFile(s.path); err != nil {
+		return err
+	}
+	log.Printf("[store] json visit file missing, recreated %s", s.path)
+	return nil
 }
 
 func (s *jsonStore) InsertVisit(uniqueID, country, city, path, referrer string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	f, err := os.OpenFile(s.path, os.O_APPEND|os.O_WRONLY, 0o644)
+	if err := s.ensureFile(); err != nil {
+		return err
+	}
+
+	f, err := os.OpenFile(s.path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
 	if err != nil {
 		return err
 	}
@@ -586,6 +760,10 @@ func (s *jsonStore) DeleteOldVisits(retentionDays int) (int64, error) {
 	defer s.mu.Unlock()
 
 	cutoff := time.Now().UTC().AddDate(0, 0, -retentionDays).Unix()
+
+	if err := s.ensureFile(); err != nil {
+		return 0, err
+	}
 
 	data, err := os.ReadFile(s.path)
 	if err != nil {
@@ -904,7 +1082,6 @@ func main() {
 	if err != nil {
 		log.Fatalf("config: %v", err)
 	}
-	log.Printf("[init] config loaded from %s", configPath)
 
 	trustedProxies, err := parseTrustedProxies(cfg.TrustedProxies)
 	if err != nil {
@@ -921,10 +1098,24 @@ func main() {
 	if cfg.DBPath != "" {
 		cfg.DBPath = resolveFromBinary(dir, cfg.DBPath)
 	}
+	if cfg.LogPath == "" {
+		cfg.LogPath = filepath.Join(dir, "data", "logs", "gount.jsonl")
+	} else {
+		cfg.LogPath = resolveFromBinary(dir, cfg.LogPath)
+	}
+
+	logSink, err := initLogger(cfg.LogPath)
+	if err != nil {
+		log.Fatalf("logger: %v", err)
+	}
+	defer logSink.Close()
+
+	log.Printf("[init] config loaded from %s", configPath)
 
 	log.Printf("[init] db type:    %s", cfg.DBType)
 	log.Printf("[init] geo type:   %s", cfg.GeoType)
 	log.Printf("[init] geodb path: %s", cfg.GeoDBPath)
+	log.Printf("[init] log path:   %s", cfg.LogPath)
 	log.Printf("[init] trusted proxies: %d", len(trustedProxies))
 	log.Printf("[init] geo-DB update reminder: every %d day(s)", cfg.UpdateFrequencyDays)
 
@@ -942,7 +1133,7 @@ func main() {
 	log.Printf("[init] store ready (%s)", cfg.DBType)
 
 	// GeoIP.
-	geoDB, err := geoip2.Open(cfg.GeoDBPath)
+	geoDB, err := openGeoDBWithRecovery(cfg.GeoDBPath, cfg.GeoType)
 	if err != nil {
 		log.Fatalf("geoip: %v", err)
 	}

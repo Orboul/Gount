@@ -14,6 +14,11 @@ server_port: 8080
 # Generate a good value with: openssl rand -hex 32
 secret_salt: "CHANGE_ME_use_openssl_rand_hex_32"
 
+# Path to the JSONL log file (relative to the binary).
+# Leave blank for the default:
+#   data/logs/gount.jsonl
+log_path: ""
+
 # Reverse proxies allowed to supply X-Forwarded-For / X-Real-IP.
 # Add exact IPs or CIDR ranges, for example:
 #   - "127.0.0.1/32"

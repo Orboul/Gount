@@ -161,6 +161,7 @@ Main settings in `config.yaml`:
 | `server_ip` | IP address to bind to. Leave blank for all interfaces. |
 | `server_port` | TCP port to listen on. |
 | `secret_salt` | Secret used when hashing visitor IDs. |
+| `log_path` | JSONL log file for runtime events. Default: `data/logs/gount.jsonl`. |
 | `trusted_proxies` | IPs or CIDRs allowed to supply `X-Forwarded-For` / `X-Real-IP`. |
 | `db_type` | Storage backend: `sqlite`, `postgres`, `mysql`, `csv`, or `json`. |
 | `db_path` | File path for file-based backends. |
@@ -169,6 +170,8 @@ Main settings in `config.yaml`:
 | `geodb_path` | Path to the GeoLite2 database file. |
 | `retention_days` | How long visit records are kept. |
 | `update_frequency_days` | Reminder cadence for refreshing GeoLite2 data. |
+
+All runtime logs are also written to a JSONL log file. By default that is `data/logs/gount.jsonl`.
 
 ## Reverse proxy setup
 

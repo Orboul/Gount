@@ -210,6 +210,11 @@ server_port: 8080
 # Note: changing this will make all existing visitor IDs unresolvable.
 secret_salt: "$salt"
 
+# Path to the JSONL log file (relative to the binary).
+# Leave blank for the default:
+#   data/logs/gount.jsonl
+log_path: ""
+
 # Reverse proxies allowed to supply X-Forwarded-For / X-Real-IP.
 # Add exact IPs or CIDR ranges, for example:
 #   - "127.0.0.1/32"
@@ -320,6 +325,7 @@ All settings live in `config.yaml` next to the binary.
 | `server_ip` | *(blank = all)* | IP address to bind to (`127.0.0.1` for local only) |
 | `server_port` | `8080` | Port the tracker listens on |
 | `secret_salt` | *(generated)* | Salt for hashing visitor IDs — treat like a password |
+| `log_path` | `data/logs/gount.jsonl` | JSONL log file for runtime events |
 | `trusted_proxies` | `[]` | IPs/CIDRs allowed to supply `X-Forwarded-For` / `X-Real-IP` |
 | `db_type` | `sqlite` | Storage backend: `sqlite`, `postgres`, `mysql`, `csv`, `json` |
 | `db_dsn` | *(empty)* | Connection string for postgres/mysql |
