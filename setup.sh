@@ -6,6 +6,8 @@ REQUIRED="1.24.0"
 REPO="https://github.com/Orboul/Gount.git"
 INSTALL_DIR="$(pwd)"
 SERVICE_NAME="gount"
+PROXY_CHOICE="none"
+PROXY_DOMAIN=""
 # ──────────────────────────────────────────────────────────────────────────────
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; BOLD='\033[1m'; DIM='\033[2m'; NC='\033[0m'
@@ -215,6 +217,14 @@ secret_salt: "$salt"
 #   data/logs/gount.jsonl
 log_path: ""
 
+# Which source to use for the client IP when the request comes from a trusted
+# proxy. Valid values:
+#   auto             -> X-Forwarded-For, then X-Real-IP, then RemoteAddr
+#   x-forwarded-for  -> X-Forwarded-For, then RemoteAddr
+#   x-real-ip        -> X-Real-IP, then RemoteAddr
+#   remote-addr      -> always use RemoteAddr
+real_ip_header: "auto"
+
 # Reverse proxies allowed to supply X-Forwarded-For / X-Real-IP.
 # Add exact IPs or CIDR ranges, for example:
 #   - "127.0.0.1/32"
@@ -256,6 +266,79 @@ EOF
     info "Secret salt generated automatically"
     if [[ "$db_type" == "postgres" || "$db_type" == "mysql" ]]; then
         warn "Update db_dsn in config.yaml with your $db_type credentials before starting."
+    fi
+}
+
+proxy_help() {
+    local config_path="$INSTALL_DIR/config.yaml"
+    local domain
+    local reply
+
+    divider
+    label "Reverse proxy help"
+    ask "Will you put gount behind nginx or Caddy for a domain like tracker.example.com?"
+    echo
+    echo -e "    ${BOLD}1)${NC} none    ${DIM}— no reverse proxy help${NC}"
+    echo -e "    ${BOLD}2)${NC} nginx   ${DIM}— show nginx snippet + config reminder${NC}"
+    echo -e "    ${BOLD}3)${NC} caddy   ${DIM}— show Caddy snippet + config reminder${NC}"
+    echo
+    read -rp "  Choice [1-3, default 1]: " reply
+    case "$reply" in
+        2) PROXY_CHOICE="nginx" ;;
+        3) PROXY_CHOICE="caddy" ;;
+        *) PROXY_CHOICE="none" ;;
+    esac
+
+    [[ "$PROXY_CHOICE" == "none" ]] && return
+
+    echo
+    read -rp "  Domain name [optional, e.g. tracker.example.com]: " domain
+    PROXY_DOMAIN="${domain:-tracker.example.com}"
+
+    echo
+    info "Proxy setup is manual by design."
+    warn "Edit $config_path and make sure these are set:"
+    echo -e "    ${BOLD}trusted_proxies:${NC}"
+    echo -e "    ${BOLD}  - \"127.0.0.1/32\"${NC}"
+    echo -e "    ${BOLD}  - \"::1/128\"${NC}"
+    echo -e "    ${BOLD}real_ip_header: \"auto\"${NC}"
+    echo
+
+    if [[ "$PROXY_CHOICE" == "nginx" ]]; then
+        label "nginx example"
+        cat <<EOF
+server {
+    server_name ${PROXY_DOMAIN};
+
+    location / {
+        proxy_pass         http://127.0.0.1:8080;
+        proxy_set_header   Host             \$host;
+        proxy_set_header   X-Forwarded-For  \$proxy_add_x_forwarded_for;
+        proxy_set_header   X-Real-IP        \$remote_addr;
+    }
+}
+EOF
+        echo
+        ask "Typical nginx commands (adjust for your distro and file layout):"
+        echo -e "    ${BOLD}sudo nano /etc/nginx/sites-available/${PROXY_DOMAIN}${NC}"
+        echo -e "    ${BOLD}sudo ln -s /etc/nginx/sites-available/${PROXY_DOMAIN} /etc/nginx/sites-enabled/${PROXY_DOMAIN}${NC}"
+        echo -e "    ${BOLD}sudo nginx -t${NC}"
+        echo -e "    ${BOLD}sudo systemctl reload nginx${NC}"
+    else
+        label "Caddy example"
+        cat <<EOF
+${PROXY_DOMAIN} {
+    reverse_proxy 127.0.0.1:8080 {
+        header_up X-Forwarded-For {remote_host}
+        header_up X-Real-IP {remote_host}
+    }
+}
+EOF
+        echo
+        ask "Typical Caddy commands (adjust for your setup):"
+        echo -e "    ${BOLD}sudo nano /etc/caddy/Caddyfile${NC}"
+        echo -e "    ${BOLD}sudo caddy validate --config /etc/caddy/Caddyfile${NC}"
+        echo -e "    ${BOLD}sudo systemctl reload caddy${NC}"
     fi
 }
 
@@ -326,6 +409,7 @@ All settings live in `config.yaml` next to the binary.
 | `server_port` | `8080` | Port the tracker listens on |
 | `secret_salt` | *(generated)* | Salt for hashing visitor IDs — treat like a password |
 | `log_path` | `data/logs/gount.jsonl` | JSONL log file for runtime events |
+| `real_ip_header` | `auto` | Which trusted proxy header to use for the client IP |
 | `trusted_proxies` | `[]` | IPs/CIDRs allowed to supply `X-Forwarded-For` / `X-Real-IP` |
 | `db_type` | `sqlite` | Storage backend: `sqlite`, `postgres`, `mysql`, `csv`, `json` |
 | `db_dsn` | *(empty)* | Connection string for postgres/mysql |
@@ -451,6 +535,7 @@ main() {
 
     install_binary "$source_dir"
     write_config
+    proxy_help
     write_readme
     install_systemd
     cleanup_source "$source_dir"

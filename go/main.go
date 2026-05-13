@@ -53,10 +53,15 @@ import (
 // ---------------------------------------------------------------------------
 
 type Config struct {
-	ServerPort int    `yaml:"server_port"`
-	ServerIP   string `yaml:"server_ip"`
-	SecretSalt string `yaml:"secret_salt"`
-	LogPath    string `yaml:"log_path"`
+	ServerPort           int    `yaml:"server_port"`
+	ServerIP             string `yaml:"server_ip"`
+	SecretSalt           string `yaml:"secret_salt"`
+	LogPath              string `yaml:"log_path"`
+	StrictTrackingErrors bool   `yaml:"strict_tracking_errors"`
+	// RealIPHeader selects how the tracker resolves the client IP once a
+	// request is confirmed to come from a trusted proxy.
+	// Valid values: auto, x-forwarded-for, x-real-ip, remote-addr.
+	RealIPHeader string `yaml:"real_ip_header"`
 	// TrustedProxies lists IPs or CIDR ranges whose forwarding headers should
 	// be trusted when resolving the real client IP. Empty means trust none.
 	TrustedProxies []string `yaml:"trusted_proxies"`
@@ -96,6 +101,18 @@ secret_salt: "CHANGE_ME_use_openssl_rand_hex_32"
 # Leave blank for the default:
 #   data/logs/gount.jsonl
 log_path: ""
+
+# When true, /t returns 503 if a visit cannot be written to storage.
+# When false, write failures are logged and /t still returns 204.
+strict_tracking_errors: false
+
+# Which source to use for the client IP when the request comes from a trusted
+# proxy. Valid values:
+#   auto             -> X-Forwarded-For, then X-Real-IP, then RemoteAddr
+#   x-forwarded-for  -> X-Forwarded-For, then RemoteAddr
+#   x-real-ip        -> X-Real-IP, then RemoteAddr
+#   remote-addr      -> always use RemoteAddr
+real_ip_header: "auto"
 
 # Reverse proxies allowed to supply X-Forwarded-For / X-Real-IP.
 # Add exact IPs or CIDR ranges, for example:
@@ -173,6 +190,14 @@ func loadConfig(path string) (*Config, error) {
 	}
 	if cfg.DBType == "" {
 		cfg.DBType = "sqlite"
+	}
+	if cfg.RealIPHeader == "" {
+		cfg.RealIPHeader = "auto"
+	}
+	switch cfg.RealIPHeader {
+	case "auto", "x-forwarded-for", "x-real-ip", "remote-addr":
+	default:
+		return nil, fmt.Errorf("invalid real_ip_header %q: valid values are auto, x-forwarded-for, x-real-ip, remote-addr", cfg.RealIPHeader)
 	}
 
 	return &cfg, nil
@@ -276,6 +301,20 @@ var geoLiteSources = []string{
 	"https://git.io",
 }
 
+var geoDBHTTPClient = &http.Client{
+	Timeout: 30 * time.Second,
+	Transport: &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   10 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		ResponseHeaderTimeout: 15 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	},
+}
+
 func ensureGeoDB(destPath, geoType string) error {
 	if _, err := os.Stat(destPath); err == nil {
 		return nil
@@ -291,7 +330,7 @@ func ensureGeoDB(destPath, geoType string) error {
 		url := fmt.Sprintf("%s/%s.mmdb", base, edition)
 		log.Printf("[geodb] downloading %s.mmdb from %s ...", edition, base)
 
-		resp, err := http.Get(url) //nolint:gosec
+		resp, err := geoDBHTTPClient.Get(url) //nolint:gosec
 		if err != nil {
 			lastErr = fmt.Errorf("download %s from %s: %w", edition, base, err)
 			log.Printf("[geodb] source failed, trying next: %v", lastErr)
@@ -379,6 +418,7 @@ func openGeoDBWithRecovery(destPath, geoType string) (*geoip2.Reader, error) {
 type Store interface {
 	InsertVisit(uniqueID, country, city, path, referrer string) error
 	DeleteOldVisits(retentionDays int) (int64, error)
+	HealthCheck() error
 	Close() error
 }
 
@@ -619,6 +659,24 @@ func (s *sqlStore) Close() error {
 	return s.db.Close()
 }
 
+func (s *sqlStore) HealthCheck() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.dbType == "sqlite" {
+		if err := s.ensureSQLitePresentLocked(); err != nil {
+			return err
+		}
+	}
+	if err := s.db.Ping(); err != nil {
+		if s.dbType == "sqlite" {
+			return fmt.Errorf("sqlite health check failed: %w", err)
+		}
+		return fmt.Errorf("%s health check failed: %w", s.dbType, err)
+	}
+	return nil
+}
+
 func shouldRecoverSQLite(err error) bool {
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "no such table: visits") ||
@@ -798,6 +856,12 @@ func (s *csvStore) DeleteOldVisits(retentionDays int) (int64, error) {
 
 func (s *csvStore) Close() error { return nil }
 
+func (s *csvStore) HealthCheck() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.ensureFile()
+}
+
 // ---------------------------------------------------------------------------
 // JSON (JSONL) store
 // ---------------------------------------------------------------------------
@@ -925,6 +989,12 @@ func (s *jsonStore) DeleteOldVisits(retentionDays int) (int64, error) {
 
 func (s *jsonStore) Close() error { return nil }
 
+func (s *jsonStore) HealthCheck() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.ensureFile()
+}
+
 // ---------------------------------------------------------------------------
 // Store factory
 // ---------------------------------------------------------------------------
@@ -993,23 +1063,29 @@ func startCleanupWorker(store Store, retentionDays int, done <-chan struct{}) {
 // IP extraction
 // ---------------------------------------------------------------------------
 
-func realIP(r *http.Request, trusted []*net.IPNet) string {
+func realIP(r *http.Request, trusted []*net.IPNet, headerMode string) string {
 	if isTrustedProxy(remoteIP(r), trusted) {
-		if ip := ipFromForwardedHeader(r.Header.Get("X-Forwarded-For")); ip != "" {
-			return ip
-		}
-		if xri := r.Header.Get("X-Real-IP"); xri != "" {
-			ip := strings.TrimSpace(xri)
-			if net.ParseIP(ip) != nil {
+		switch headerMode {
+		case "x-forwarded-for":
+			if ip := ipFromForwardedHeader(r.Header.Get("X-Forwarded-For")); ip != "" {
+				return ip
+			}
+		case "x-real-ip":
+			if ip := ipFromRealIPHeader(r.Header.Get("X-Real-IP")); ip != "" {
+				return ip
+			}
+		case "remote-addr":
+			return socketIP(r)
+		default: // auto
+			if ip := ipFromForwardedHeader(r.Header.Get("X-Forwarded-For")); ip != "" {
+				return ip
+			}
+			if ip := ipFromRealIPHeader(r.Header.Get("X-Real-IP")); ip != "" {
 				return ip
 			}
 		}
 	}
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return r.RemoteAddr
-	}
-	return host
+	return socketIP(r)
 }
 
 // ---------------------------------------------------------------------------
@@ -1027,6 +1103,10 @@ func deriveUserID(ip, userAgent, salt string) string {
 // ---------------------------------------------------------------------------
 
 func geoLookup(geoDB *geoip2.Reader, ipStr, geoType string) (country, city string) {
+	if geoDB == nil {
+		return "", ""
+	}
+
 	ip := net.ParseIP(ipStr)
 	if ip == nil {
 		return "", ""
@@ -1067,13 +1147,18 @@ func (a *App) trackHandler(w http.ResponseWriter, r *http.Request) {
 
 	// Browsers send a preflight OPTIONS before cross-origin GETs with custom headers.
 	if r.Method == http.MethodOptions {
-		w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS")
 		w.Header().Set("Access-Control-Max-Age", "86400")
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		w.Header().Set("Allow", "GET, HEAD, OPTIONS")
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
 
-	ip := realIP(r, a.trustedProxies)
+	ip := realIP(r, a.trustedProxies, a.cfg.RealIPHeader)
 	ua := r.UserAgent()
 
 	path := r.URL.Query().Get("p")
@@ -1097,15 +1182,47 @@ func (a *App) trackHandler(w http.ResponseWriter, r *http.Request) {
 
 	if err := a.store.InsertVisit(uniqueID, country, city, path, referrer); err != nil {
 		log.Printf("[track] insert error: %v", err)
+		if a.cfg.StrictTrackingErrors {
+			http.Error(w, "tracker storage unavailable", http.StatusServiceUnavailable)
+			return
+		}
 	}
 
 	w.WriteHeader(http.StatusNoContent)
 }
 
-func healthHandler(w http.ResponseWriter, r *http.Request) {
+func (a *App) healthHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	if err := a.readinessCheck(); err != nil {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		fmt.Fprintf(w, "unhealthy: %v\n", err)
+		return
+	}
 	w.WriteHeader(http.StatusOK)
 	fmt.Fprintln(w, "ok")
+}
+
+func (a *App) readinessCheck() error {
+	if err := a.store.HealthCheck(); err != nil {
+		return fmt.Errorf("store not ready: %w", err)
+	}
+	if a.geoDB == nil {
+		return fmt.Errorf("geodb is not initialized")
+	}
+	probeIP := net.ParseIP("1.1.1.1")
+	if probeIP == nil {
+		return fmt.Errorf("failed to build geodb probe IP")
+	}
+	if a.cfg.GeoType == "city" {
+		if _, err := a.geoDB.City(probeIP); err != nil {
+			return fmt.Errorf("geodb city lookup failed: %w", err)
+		}
+	} else {
+		if _, err := a.geoDB.Country(probeIP); err != nil {
+			return fmt.Errorf("geodb country lookup failed: %w", err)
+		}
+	}
+	return nil
 }
 
 func parseTrustedProxies(entries []string) ([]*net.IPNet, error) {
@@ -1141,11 +1258,15 @@ func parseTrustedProxies(entries []string) ([]*net.IPNet, error) {
 }
 
 func remoteIP(r *http.Request) net.IP {
+	return net.ParseIP(strings.TrimSpace(socketIP(r)))
+}
+
+func socketIP(r *http.Request) string {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
-		host = r.RemoteAddr
+		return r.RemoteAddr
 	}
-	return net.ParseIP(strings.TrimSpace(host))
+	return host
 }
 
 func ipFromForwardedHeader(xff string) string {
@@ -1157,6 +1278,14 @@ func ipFromForwardedHeader(xff string) string {
 		if net.ParseIP(ip) != nil {
 			return ip
 		}
+	}
+	return ""
+}
+
+func ipFromRealIPHeader(xri string) string {
+	ip := strings.TrimSpace(xri)
+	if net.ParseIP(ip) != nil {
+		return ip
 	}
 	return ""
 }
@@ -1233,6 +1362,7 @@ func main() {
 	log.Printf("[init] geo type:   %s", cfg.GeoType)
 	log.Printf("[init] geodb path: %s", cfg.GeoDBPath)
 	log.Printf("[init] log path:   %s", cfg.LogPath)
+	log.Printf("[init] strict tracking errors: %t", cfg.StrictTrackingErrors)
 	log.Printf("[init] trusted proxies: %d", len(trustedProxies))
 	log.Printf("[init] geo-DB update reminder: every %d day(s)", cfg.UpdateFrequencyDays)
 
@@ -1266,7 +1396,7 @@ func main() {
 	app := &App{cfg: cfg, store: store, geoDB: geoDB, trustedProxies: trustedProxies}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/t", app.trackHandler)
-	mux.HandleFunc("/health", healthHandler)
+	mux.HandleFunc("/health", app.healthHandler)
 
 	addr := fmt.Sprintf("%s:%d", cfg.ServerIP, cfg.ServerPort)
 	srv := &http.Server{

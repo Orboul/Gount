@@ -6,7 +6,7 @@ It is designed for people who want simple traffic tracking without handing visit
 
 ## Simple Install
 
-This will download, build, and configer your gount program.
+Run this the download or update you program.
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Orboul/Gount/main/setup.sh -o setup.sh && bash setup.sh
 ```
@@ -182,16 +182,16 @@ All runtime logs are also written to a JSONL log file. By default that is `data/
 
 ## Reverse proxy setup
 
-If gount is behind nginx, Caddy, or another reverse proxy, configure `trusted_proxies` so it will trust forwarded client IP headers.
-
-Example:
+If gount is behind nginx, Caddy, or another reverse proxy, configure `trusted_proxies` so it correctly identifies forwarded client IPs.
 
 ```yaml
 trusted_proxies:
-  - "127.0.0.1/32"
-  - "::1/128"
-  - "10.0.0.0/8"
+  - "127.0.0.1/32"   # proxy on the same host (IPv4)
+  - "::1/128"         # proxy on the same host (IPv6)
+  - "10.0.0.0/8"      # internal network range
 ```
+
+If your proxy (nginx or Caddy) runs on the same server as gount, `127.0.0.1/32` is all you need.
 
 ### nginx example
 

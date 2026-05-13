@@ -19,6 +19,18 @@ secret_salt: "CHANGE_ME_use_openssl_rand_hex_32"
 #   data/logs/gount.jsonl
 log_path: ""
 
+# When true, /t returns 503 if a visit cannot be written to storage.
+# When false, write failures are logged and /t still returns 204.
+strict_tracking_errors: false
+
+# Which source to use for the client IP when the request comes from a trusted
+# proxy. Valid values:
+#   auto             -> X-Forwarded-For, then X-Real-IP, then RemoteAddr
+#   x-forwarded-for  -> X-Forwarded-For, then RemoteAddr
+#   x-real-ip        -> X-Real-IP, then RemoteAddr
+#   remote-addr      -> always use RemoteAddr
+real_ip_header: "auto"
+
 # Reverse proxies allowed to supply X-Forwarded-For / X-Real-IP.
 # Add exact IPs or CIDR ranges, for example:
 #   - "127.0.0.1/32"
