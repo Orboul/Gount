@@ -3,6 +3,7 @@ set -euo pipefail
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 REQUIRED="1.24.0"
+version="0.3.0"
 REPO="${GOUNT_REPO:-https://github.com/orboul/gount.git}"
 INSTALL_DIR="$(pwd)"
 SERVICE_NAME="gount"
@@ -533,6 +534,7 @@ main() {
     echo "  ╚██████╔╝╚██████╔╝╚██████╔╝██║ ╚████║   ██║"
     echo "   ╚═════╝  ╚═════╝  ╚═════╝ ╚═╝  ╚═══╝   ╚═╝"
     echo -e "${NC}  Privacy-first beacon endpoint\n"
+    echo -e "version: ${version}"
 
     echo -e "  This will build and install gount to ${BOLD}$INSTALL_DIR${NC}."
     echo
