@@ -23,6 +23,16 @@ log_path: ""
 # When false, write failures are logged and /t still returns 204.
 strict_tracking_errors: false
 
+# Which browser origins may call /t cross-origin.
+# Leave empty to deny cross-origin browser beacons by default.
+# Set one or more explicit origins, for example:
+#   - "https://example.com"
+#   - "https://www.example.com"
+# Or set:
+#   - "*"
+# only if you intentionally want public collection.
+cors_allowed_origins: []
+
 # Which source to use for the client IP when the request comes from a trusted
 # proxy. Valid values:
 #   auto             -> X-Forwarded-For, then X-Real-IP, then RemoteAddr
@@ -38,6 +48,13 @@ real_ip_header: "auto"
 #   - "10.0.0.0/8"
 # Leave empty to ignore proxy headers entirely.
 trusted_proxies: []
+
+# Per-IP request limits.
+# Zero uses the secure defaults. Set a negative value to disable a limiter.
+track_rate_limit_rps: 20
+track_rate_limit_burst: 40
+health_rate_limit_rps: 2
+health_rate_limit_burst: 4
 
 # Storage backend: sqlite | postgres | mysql | csv | json
 db_type: "sqlite"
@@ -55,7 +72,6 @@ db_path: ""
 db_dsn: ""
 
 # GeoLite2 edition to use: "country" (smaller, faster) or "city" (includes city name).
-# This also controls which edition is auto-downloaded.
 geo_type: "country"
 
 # Path to the MaxMind GeoLite2 .mmdb file (relative to the binary directory).
@@ -64,10 +80,10 @@ geo_type: "country"
 #   data/geodata/GeoLite2-City.mmdb     (when geo_type: city)
 geodb_path: ""
 
+# Optional SHA-256 checksum for the GeoLite2 .mmdb file.
+# Leave blank to skip checksum verification.
+geodb_sha256: ""
+
 # Number of days to retain visit records.
 # The background worker deletes rows older than this every 24 hours.
 retention_days: 90
-
-# Metadata only — reminds the operator how often to refresh the GeoLite2 DB.
-# MaxMind updates GeoLite2 every Tuesday; bi-weekly is a sensible cadence.
-update_frequency_days: 14

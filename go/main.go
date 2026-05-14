@@ -1,10 +1,11 @@
-// gount - A lightweight, privacy-first pixel tracker written in Go.
+// gount - A lightweight, privacy-first beacon endpoint written in Go.
 //
 // It exposes a single /t endpoint that:
 //   - Derives a pseudonymous User ID from IP + User-Agent + secret salt (SHA-256)
 //   - Resolves the visitor's country (and optionally city) via a local MaxMind GeoLite2 database
 //   - Persists the visit record to a configurable storage backend
 //   - Returns HTTP 204 No Content so the payload is as small as possible
+//   - Works well with browser APIs such as navigator.sendBeacon()
 //
 // Directory layout (relative to the binary):
 //
@@ -19,15 +20,17 @@
 //
 // Supported db_type values: sqlite, postgres, mysql, csv, json
 //
-// On first run the binary bootstraps itself: writes a default config.yaml and
-// downloads the chosen GeoLite2 edition from https://github.com/P3TERX/GeoLite.mmdb
+// On first run the binary bootstraps itself by writing a default config.yaml.
+// Operators must provision the GeoLite2 database file before startup.
 package main
 
 import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/csv"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -58,6 +61,9 @@ type Config struct {
 	SecretSalt           string `yaml:"secret_salt"`
 	LogPath              string `yaml:"log_path"`
 	StrictTrackingErrors bool   `yaml:"strict_tracking_errors"`
+	// CORSAllowedOrigins controls which browser origins may call /t.
+	// Empty denies cross-origin use; "*" is an explicit opt-in for public use.
+	CORSAllowedOrigins []string `yaml:"cors_allowed_origins"`
 	// RealIPHeader selects how the tracker resolves the client IP once a
 	// request is confirmed to come from a trusted proxy.
 	// Valid values: auto, x-forwarded-for, x-real-ip, remote-addr.
@@ -65,6 +71,11 @@ type Config struct {
 	// TrustedProxies lists IPs or CIDR ranges whose forwarding headers should
 	// be trusted when resolving the real client IP. Empty means trust none.
 	TrustedProxies []string `yaml:"trusted_proxies"`
+	// Per-IP rate limiting. Zero uses the secure default; negative disables.
+	TrackRateLimitRPS    float64 `yaml:"track_rate_limit_rps"`
+	TrackRateLimitBurst  int     `yaml:"track_rate_limit_burst"`
+	HealthRateLimitRPS   float64 `yaml:"health_rate_limit_rps"`
+	HealthRateLimitBurst int     `yaml:"health_rate_limit_burst"`
 
 	// DBType selects the storage backend: sqlite, postgres, mysql, csv, json
 	DBType string `yaml:"db_type"`
@@ -75,11 +86,20 @@ type Config struct {
 	// mysql:    "user:pass@tcp(host:3306)/dbname?parseTime=true"
 	DBDSN string `yaml:"db_dsn"`
 
-	GeoType             string `yaml:"geo_type"`
-	GeoDBPath           string `yaml:"geodb_path"`
-	RetentionDays       int    `yaml:"retention_days"`
-	UpdateFrequencyDays int    `yaml:"update_frequency_days"`
+	GeoType       string `yaml:"geo_type"`
+	GeoDBPath     string `yaml:"geodb_path"`
+	GeoDBSHA256   string `yaml:"geodb_sha256"`
+	RetentionDays int    `yaml:"retention_days"`
 }
+
+const (
+	placeholderSalt             = "CHANGE_ME_use_openssl_rand_hex_32"
+	defaultTrackRateLimitRPS    = 20
+	defaultTrackRateLimitBurst  = 40
+	defaultHealthRateLimitRPS   = 2
+	defaultHealthRateLimitBurst = 4
+	maxBeaconBody               = 4096
+)
 
 const defaultConfigYAML = `# gount configuration
 # -------------------------------------------------------------------
@@ -106,6 +126,16 @@ log_path: ""
 # When false, write failures are logged and /t still returns 204.
 strict_tracking_errors: false
 
+# Which browser origins may call /t cross-origin.
+# Leave empty to deny cross-origin browser beacons by default.
+# Set one or more explicit origins, for example:
+#   - "https://example.com"
+#   - "https://www.example.com"
+# Or set:
+#   - "*"
+# only if you intentionally want public collection.
+cors_allowed_origins: []
+
 # Which source to use for the client IP when the request comes from a trusted
 # proxy. Valid values:
 #   auto             -> X-Forwarded-For, then X-Real-IP, then RemoteAddr
@@ -121,6 +151,13 @@ real_ip_header: "auto"
 #   - "10.0.0.0/8"
 # Leave empty to ignore proxy headers entirely.
 trusted_proxies: []
+
+# Per-IP request limits.
+# Zero uses the secure defaults. Set a negative value to disable a limiter.
+track_rate_limit_rps: 20
+track_rate_limit_burst: 40
+health_rate_limit_rps: 2
+health_rate_limit_burst: 4
 
 # Storage backend: sqlite | postgres | mysql | csv | json
 db_type: "sqlite"
@@ -138,7 +175,6 @@ db_path: ""
 db_dsn: ""
 
 # GeoLite2 edition: "country" (smaller) or "city" (includes city name).
-# Auto-downloaded from https://github.com/P3TERX/GeoLite.mmdb on first run.
 geo_type: "country"
 
 # Path to the GeoLite2 .mmdb file (relative to binary dir).
@@ -147,11 +183,12 @@ geo_type: "country"
 #   data/geodata/GeoLite2-City.mmdb
 geodb_path: ""
 
+# Optional SHA-256 checksum for the GeoLite2 .mmdb file.
+# Leave blank to skip checksum verification.
+geodb_sha256: ""
+
 # Number of days to retain visit records.
 retention_days: 90
-
-# Reminder cadence for refreshing the GeoLite2 DB (metadata only).
-update_frequency_days: 14
 `
 
 func writeDefaultConfig(path string) error {
@@ -182,9 +219,6 @@ func loadConfig(path string) (*Config, error) {
 	if cfg.RetentionDays == 0 {
 		cfg.RetentionDays = 90
 	}
-	if cfg.UpdateFrequencyDays == 0 {
-		cfg.UpdateFrequencyDays = 14
-	}
 	if cfg.GeoType != "city" {
 		cfg.GeoType = "country"
 	}
@@ -198,6 +232,36 @@ func loadConfig(path string) (*Config, error) {
 	case "auto", "x-forwarded-for", "x-real-ip", "remote-addr":
 	default:
 		return nil, fmt.Errorf("invalid real_ip_header %q: valid values are auto, x-forwarded-for, x-real-ip, remote-addr", cfg.RealIPHeader)
+	}
+	for i := range cfg.CORSAllowedOrigins {
+		cfg.CORSAllowedOrigins[i] = strings.TrimSpace(cfg.CORSAllowedOrigins[i])
+	}
+	cfg.GeoDBSHA256 = strings.ToLower(strings.TrimSpace(cfg.GeoDBSHA256))
+	if cfg.TrackRateLimitRPS == 0 {
+		cfg.TrackRateLimitRPS = defaultTrackRateLimitRPS
+	}
+	if cfg.TrackRateLimitBurst == 0 {
+		cfg.TrackRateLimitBurst = defaultTrackRateLimitBurst
+	}
+	if cfg.HealthRateLimitRPS == 0 {
+		cfg.HealthRateLimitRPS = defaultHealthRateLimitRPS
+	}
+	if cfg.HealthRateLimitBurst == 0 {
+		cfg.HealthRateLimitBurst = defaultHealthRateLimitBurst
+	}
+	if cfg.TrackRateLimitBurst < 0 {
+		cfg.TrackRateLimitBurst = 0
+	}
+	if cfg.HealthRateLimitBurst < 0 {
+		cfg.HealthRateLimitBurst = 0
+	}
+	if cfg.GeoDBSHA256 != "" {
+		if len(cfg.GeoDBSHA256) != 64 {
+			return nil, fmt.Errorf("geodb_sha256 must be a 64-character lowercase hex SHA-256 digest")
+		}
+		if _, err := hex.DecodeString(cfg.GeoDBSHA256); err != nil {
+			return nil, fmt.Errorf("geodb_sha256 must be valid lowercase hex: %w", err)
+		}
 	}
 
 	return &cfg, nil
@@ -286,7 +350,7 @@ func initLogger(path string) (io.Closer, error) {
 }
 
 // ---------------------------------------------------------------------------
-// GeoLite2 auto-download
+// GeoLite2 loading
 // ---------------------------------------------------------------------------
 
 func geoEdition(geoType string) string {
@@ -296,116 +360,34 @@ func geoEdition(geoType string) string {
 	return "GeoLite2-Country"
 }
 
-var geoLiteSources = []string{
-	"https://github.com/P3TERX/GeoLite.mmdb/raw/download",
-	"https://git.io",
-}
-
-var geoDBHTTPClient = &http.Client{
-	Timeout: 30 * time.Second,
-	Transport: &http.Transport{
-		Proxy: http.ProxyFromEnvironment,
-		DialContext: (&net.Dialer{
-			Timeout:   10 * time.Second,
-			KeepAlive: 30 * time.Second,
-		}).DialContext,
-		ResponseHeaderTimeout: 15 * time.Second,
-		TLSHandshakeTimeout:   10 * time.Second,
-		ExpectContinueTimeout: 1 * time.Second,
-	},
-}
-
-func ensureGeoDB(destPath, geoType string) error {
-	if _, err := os.Stat(destPath); err == nil {
+func verifyGeoDBChecksum(path, want string) error {
+	if want == "" {
 		return nil
 	}
-
-	if err := os.MkdirAll(filepath.Dir(destPath), 0o755); err != nil {
-		return fmt.Errorf("create geodata dir: %w", err)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("read geodb checksum input: %w", err)
 	}
-
-	edition := geoEdition(geoType)
-	var lastErr error
-	for _, base := range geoLiteSources {
-		url := fmt.Sprintf("%s/%s.mmdb", base, edition)
-		log.Printf("[geodb] downloading %s.mmdb from %s ...", edition, base)
-
-		resp, err := geoDBHTTPClient.Get(url) //nolint:gosec
-		if err != nil {
-			lastErr = fmt.Errorf("download %s from %s: %w", edition, base, err)
-			log.Printf("[geodb] source failed, trying next: %v", lastErr)
-			continue
-		}
-
-		if resp.StatusCode != http.StatusOK {
-			lastErr = fmt.Errorf("download %s from %s: server returned %s", edition, base, resp.Status)
-			log.Printf("[geodb] source failed, trying next: %v", lastErr)
-			_ = resp.Body.Close()
-			continue
-		}
-
-		tmpPath := destPath + ".download"
-		out, err := os.Create(tmpPath)
-		if err != nil {
-			_ = resp.Body.Close()
-			return fmt.Errorf("create %s: %w", tmpPath, err)
-		}
-
-		if _, err := io.Copy(out, resp.Body); err != nil {
-			_ = out.Close()
-			_ = resp.Body.Close()
-			_ = os.Remove(tmpPath)
-			return fmt.Errorf("write %s: %w", tmpPath, err)
-		}
-		if err := out.Close(); err != nil {
-			_ = resp.Body.Close()
-			_ = os.Remove(tmpPath)
-			return fmt.Errorf("close %s: %w", tmpPath, err)
-		}
-		_ = resp.Body.Close()
-
-		testDB, err := geoip2.Open(tmpPath)
-		if err != nil {
-			_ = os.Remove(tmpPath)
-			lastErr = fmt.Errorf("downloaded %s is invalid: %w", tmpPath, err)
-			log.Printf("[geodb] source failed, trying next: %v", lastErr)
-			continue
-		}
-		_ = testDB.Close()
-
-		if err := os.Rename(tmpPath, destPath); err != nil {
-			_ = os.Remove(tmpPath)
-			return fmt.Errorf("activate %s: %w", destPath, err)
-		}
-
-		log.Printf("[geodb] %s.mmdb saved to %s", edition, destPath)
-		return nil
+	got := fmt.Sprintf("%x", sha256.Sum256(data))
+	if got != want {
+		return fmt.Errorf("geodb checksum mismatch: got %s", got)
 	}
-	return lastErr
+	return nil
 }
 
-func openGeoDBWithRecovery(destPath, geoType string) (*geoip2.Reader, error) {
-	if err := ensureGeoDB(destPath, geoType); err != nil {
+func openGeoDB(path, geoType, wantSHA256 string) (*geoip2.Reader, error) {
+	if _, err := os.Stat(path); err != nil {
+		if os.IsNotExist(err) {
+			return nil, fmt.Errorf("geodb file %s is missing; provision the matching %s.mmdb before startup", path, geoEdition(geoType))
+		}
+		return nil, fmt.Errorf("stat geodb: %w", err)
+	}
+	if err := verifyGeoDBChecksum(path, wantSHA256); err != nil {
 		return nil, err
 	}
-
-	geoDB, err := geoip2.Open(destPath)
-	if err == nil {
-		return geoDB, nil
-	}
-
-	log.Printf("[geodb] existing database is invalid or unreadable, redownloading: %v", err)
-	if removeErr := os.Remove(destPath); removeErr != nil && !os.IsNotExist(removeErr) {
-		return nil, fmt.Errorf("remove invalid geodb %s: %w", destPath, removeErr)
-	}
-
-	if err := ensureGeoDB(destPath, geoType); err != nil {
-		return nil, fmt.Errorf("redownload geodb: %w", err)
-	}
-
-	geoDB, err = geoip2.Open(destPath)
+	geoDB, err := geoip2.Open(path)
 	if err != nil {
-		return nil, fmt.Errorf("open redownloaded geodb: %w", err)
+		return nil, fmt.Errorf("open geodb: %w", err)
 	}
 	return geoDB, nil
 }
@@ -567,10 +549,9 @@ func migrateReferrer(db *sql.DB, dbType string) {
 }
 
 func (s *sqlStore) InsertVisit(uniqueID, country, city, path, referrer string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	if s.dbType == "sqlite" {
+		s.mu.Lock()
+		defer s.mu.Unlock()
 		if err := s.ensureSQLitePresentLocked(); err != nil {
 			return fmt.Errorf("sqlite insert failed while preparing local database: %w", err)
 		}
@@ -610,10 +591,9 @@ func (s *sqlStore) InsertVisit(uniqueID, country, city, path, referrer string) e
 }
 
 func (s *sqlStore) DeleteOldVisits(retentionDays int) (int64, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	if s.dbType == "sqlite" {
+		s.mu.Lock()
+		defer s.mu.Unlock()
 		if err := s.ensureSQLitePresentLocked(); err != nil {
 			return 0, fmt.Errorf("sqlite cleanup failed while preparing local database: %w", err)
 		}
@@ -660,10 +640,9 @@ func (s *sqlStore) Close() error {
 }
 
 func (s *sqlStore) HealthCheck() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	if s.dbType == "sqlite" {
+		s.mu.Lock()
+		defer s.mu.Unlock()
 		if err := s.ensureSQLitePresentLocked(); err != nil {
 			return err
 		}
@@ -1140,38 +1119,155 @@ type App struct {
 	store          Store
 	geoDB          *geoip2.Reader
 	trustedProxies []*net.IPNet
+	trackLimiter   *ipRateLimiter
+	healthLimiter  *ipRateLimiter
+}
+
+func (a *App) corsAllowOrigin(origin string) string {
+	for _, allowed := range a.cfg.CORSAllowedOrigins {
+		if allowed == "" {
+			continue
+		}
+		if allowed == "*" {
+			return "*"
+		}
+		if origin != "" && origin == allowed {
+			return origin
+		}
+	}
+	return ""
+}
+
+type ipRateLimiter struct {
+	mu      sync.Mutex
+	rate    float64
+	burst   float64
+	entries map[string]*rateLimitEntry
+}
+
+type rateLimitEntry struct {
+	tokens   float64
+	last     time.Time
+	lastSeen time.Time
+}
+
+func newIPRateLimiter(rate float64, burst int) *ipRateLimiter {
+	if rate <= 0 || burst <= 0 {
+		return nil
+	}
+	return &ipRateLimiter{
+		rate:    rate,
+		burst:   float64(burst),
+		entries: make(map[string]*rateLimitEntry),
+	}
+}
+
+func (l *ipRateLimiter) allow(key string) bool {
+	if l == nil {
+		return true
+	}
+
+	now := time.Now()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	l.pruneLocked(now)
+
+	entry := l.entries[key]
+	if entry == nil {
+		l.entries[key] = &rateLimitEntry{
+			tokens:   l.burst - 1,
+			last:     now,
+			lastSeen: now,
+		}
+		return true
+	}
+
+	elapsed := now.Sub(entry.last).Seconds()
+	entry.tokens = minFloat(l.burst, entry.tokens+(elapsed*l.rate))
+	entry.last = now
+	entry.lastSeen = now
+	if entry.tokens < 1 {
+		return false
+	}
+	entry.tokens--
+	return true
+}
+
+func (l *ipRateLimiter) pruneLocked(now time.Time) {
+	if len(l.entries) <= 1024 {
+		return
+	}
+	for key, entry := range l.entries {
+		if now.Sub(entry.lastSeen) > 10*time.Minute {
+			delete(l.entries, key)
+		}
+	}
+}
+
+func minFloat(a, b float64) float64 {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func (a *App) trackHandler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Access-Control-Allow-Origin", "*")
+	origin := r.Header.Get("Origin")
+	if allowOrigin := a.corsAllowOrigin(origin); allowOrigin != "" {
+		w.Header().Set("Access-Control-Allow-Origin", allowOrigin)
+		w.Header().Add("Vary", "Origin")
+	}
 
-	// Browsers send a preflight OPTIONS before cross-origin GETs with custom headers.
 	if r.Method == http.MethodOptions {
-		w.Header().Set("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS")
-		w.Header().Set("Access-Control-Max-Age", "86400")
+		if origin != "" && a.corsAllowOrigin(origin) == "" {
+			http.Error(w, "origin not allowed", http.StatusForbidden)
+			return
+		}
+		w.Header().Set("Access-Control-Allow-Methods", "POST")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		w.Header().Set("Access-Control-Max-Age", "600")
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
-	if r.Method != http.MethodGet && r.Method != http.MethodHead {
-		w.Header().Set("Allow", "GET, HEAD, OPTIONS")
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", "OPTIONS, POST")
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
 	ip := realIP(r, a.trustedProxies, a.cfg.RealIPHeader)
+	if !a.trackLimiter.allow(ip) {
+		http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
+		return
+	}
 	ua := r.UserAgent()
 
-	path := r.URL.Query().Get("p")
+	r.Body = http.MaxBytesReader(w, r.Body, maxBeaconBody)
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		var maxErr *http.MaxBytesError
+		if errors.As(err, &maxErr) {
+			http.Error(w, "beacon payload too large", http.StatusRequestEntityTooLarge)
+			return
+		}
+		http.Error(w, "invalid beacon payload", http.StatusBadRequest)
+		return
+	}
+	values, err := url.ParseQuery(string(body))
+	if err != nil {
+		http.Error(w, "invalid beacon payload", http.StatusBadRequest)
+		return
+	}
+
+	path := values.Get("p")
 	if path == "" {
 		path = "/"
 	}
 	path = truncate(path, 255)
 
-	// Explicit ?ref= param takes priority over the HTTP Referer header.
-	// This lets UTM-style links (page.html?ref=newsletter) be tracked
-	// even when the browser sends no Referer.
 	var referrer string
-	if ref := r.URL.Query().Get("ref"); ref != "" {
+	if ref := values.Get("ref"); ref != "" {
 		referrer = truncate(ref, 255)
 	} else {
 		referrer = truncate(extractReferrer(r.Referer()), 255)
@@ -1192,10 +1288,21 @@ func (a *App) trackHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) healthHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		w.Header().Set("Allow", "GET, HEAD")
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !a.healthLimiter.allow(realIP(r, a.trustedProxies, a.cfg.RealIPHeader)) {
+		http.Error(w, "rate limit exceeded", http.StatusTooManyRequests)
+		return
+	}
+
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	if err := a.readinessCheck(); err != nil {
+		log.Printf("[health] readiness check failed: %v", err)
 		w.WriteHeader(http.StatusServiceUnavailable)
-		fmt.Fprintf(w, "unhealthy: %v\n", err)
+		fmt.Fprintln(w, "unhealthy")
 		return
 	}
 	w.WriteHeader(http.StatusOK)
@@ -1328,6 +1435,9 @@ func main() {
 	if err != nil {
 		log.Fatalf("config: %v", err)
 	}
+	if strings.TrimSpace(cfg.SecretSalt) == "" || cfg.SecretSalt == placeholderSalt {
+		log.Fatal("config: secret_salt must be set to a unique random value before startup")
+	}
 
 	trustedProxies, err := parseTrustedProxies(cfg.TrustedProxies)
 	if err != nil {
@@ -1364,13 +1474,8 @@ func main() {
 	log.Printf("[init] log path:   %s", cfg.LogPath)
 	log.Printf("[init] strict tracking errors: %t", cfg.StrictTrackingErrors)
 	log.Printf("[init] trusted proxies: %d", len(trustedProxies))
-	log.Printf("[init] geo-DB update reminder: every %d day(s)", cfg.UpdateFrequencyDays)
-
-	// GeoLite2: download if missing.
-	if err := ensureGeoDB(cfg.GeoDBPath, cfg.GeoType); err != nil {
-		log.Fatalf("geodb: %v", err)
-	}
-
+	log.Printf("[init] track rate limit: %.2fr/s burst=%d", cfg.TrackRateLimitRPS, cfg.TrackRateLimitBurst)
+	log.Printf("[init] health rate limit: %.2fr/s burst=%d", cfg.HealthRateLimitRPS, cfg.HealthRateLimitBurst)
 	// Storage backend.
 	store, err := newStore(cfg, dir)
 	if err != nil {
@@ -1379,8 +1484,8 @@ func main() {
 	defer store.Close()
 	log.Printf("[init] store ready (%s)", cfg.DBType)
 
-	// GeoIP.
-	geoDB, err := openGeoDBWithRecovery(cfg.GeoDBPath, cfg.GeoType)
+	// GeoIP is operator-provisioned and optionally checksum-verified at startup.
+	geoDB, err := openGeoDB(cfg.GeoDBPath, cfg.GeoType, cfg.GeoDBSHA256)
 	if err != nil {
 		log.Fatalf("geoip: %v", err)
 	}
@@ -1393,7 +1498,14 @@ func main() {
 	startCleanupWorker(store, cfg.RetentionDays, done)
 
 	// HTTP routes.
-	app := &App{cfg: cfg, store: store, geoDB: geoDB, trustedProxies: trustedProxies}
+	app := &App{
+		cfg:            cfg,
+		store:          store,
+		geoDB:          geoDB,
+		trustedProxies: trustedProxies,
+		trackLimiter:   newIPRateLimiter(cfg.TrackRateLimitRPS, cfg.TrackRateLimitBurst),
+		healthLimiter:  newIPRateLimiter(cfg.HealthRateLimitRPS, cfg.HealthRateLimitBurst),
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/t", app.trackHandler)
 	mux.HandleFunc("/health", app.healthHandler)

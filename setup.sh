@@ -3,7 +3,7 @@ set -euo pipefail
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 REQUIRED="1.24.0"
-REPO="https://github.com/Orboul/Gount.git"
+REPO="${GOUNT_REPO:-https://github.com/matthewsaw/gount.git}"
 INSTALL_DIR="$(pwd)"
 SERVICE_NAME="gount"
 PROXY_CHOICE="none"
@@ -55,7 +55,7 @@ build_binary() {
 
     cd go
     info "Compiling..." >&2
-    go build -o "$source_dir/gount" ./... || { echo -e "  ${RED}✘${NC}  Build failed." >&2; exit 1; }
+    go build -o "$source_dir/gount" . || { echo -e "  ${RED}✘${NC}  Build failed." >&2; exit 1; }
     info "Build complete" >&2
 
     echo "$source_dir"
@@ -65,25 +65,14 @@ build_binary() {
 install_binary() {
     local source_dir="$1"
     local target_path="$INSTALL_DIR/gount"
-    local reply
 
     step "Installing"
     mkdir -p "$INSTALL_DIR"
-    install -m 644 "$source_dir/gount" "$target_path"
+    install -m 755 "$source_dir/gount" "$target_path"
+    mkdir -p "$INSTALL_DIR/data/geodata"
     info "Binary installed  →  $target_path"
-
-    echo
-    label "Executable permission"
-    ask "Would you like setup to make the gount binary executable now?"
-    read -rp "  Make executable? [Y/n] " reply
-    if [[ "$reply" =~ ^[Nn]$ ]]; then
-        warn "Left binary non-executable."
-        echo -e "  To make it executable later:"
-        echo -e "    ${BOLD}chmod +x ${target_path}${NC}"
-    else
-        chmod +x "$target_path"
-        info "Binary marked executable"
-    fi
+    info "Binary is executable"
+    info "GeoDB directory   →  $INSTALL_DIR/data/geodata"
 }
 
 # ─── Config ───────────────────────────────────────────────────────────────────
@@ -156,20 +145,6 @@ write_config() {
     esac
     info "Geo accuracy: $geo_type"
 
-    # ── Geodata refresh reminder ──
-    divider
-    label "Geodata update reminder"
-    ask "MaxMind updates the GeoLite2 database weekly. How often should"
-    ask "gount remind you to refresh it?"
-    echo
-    read -rp "  Every how many days? [default 14]: " geo_update_input
-    local update_frequency_days="${geo_update_input:-14}"
-    if ! [[ "$update_frequency_days" =~ ^[0-9]+$ ]] || [[ "$update_frequency_days" -lt 1 ]]; then
-        warn "Invalid value — using 14."
-        update_frequency_days=14
-    fi
-    info "Geodata reminder: every $update_frequency_days days"
-
     # ── Data retention ──
     divider
     label "Visitor data retention"
@@ -217,6 +192,20 @@ secret_salt: "$salt"
 #   data/logs/gount.jsonl
 log_path: ""
 
+# When true, /t returns 503 if a visit cannot be written to storage.
+# When false, write failures are logged and /t still returns 204.
+strict_tracking_errors: false
+
+# Which browser origins may call /t cross-origin.
+# Leave empty to deny cross-origin browser beacons by default.
+# Set one or more explicit origins, for example:
+#   - "https://example.com"
+#   - "https://www.example.com"
+# Or set:
+#   - "*"
+# only if you intentionally want public collection.
+cors_allowed_origins: []
+
 # Which source to use for the client IP when the request comes from a trusted
 # proxy. Valid values:
 #   auto             -> X-Forwarded-For, then X-Real-IP, then RemoteAddr
@@ -233,6 +222,13 @@ real_ip_header: "auto"
 # Leave empty to ignore proxy headers entirely.
 trusted_proxies: []
 
+# Per-IP request limits.
+# Zero uses the secure defaults. Set a negative value to disable a limiter.
+track_rate_limit_rps: 20
+track_rate_limit_burst: 40
+health_rate_limit_rps: 2
+health_rate_limit_burst: 4
+
 # Storage backend: sqlite | postgres | mysql | csv | json
 db_type: "$db_type"
 
@@ -246,24 +242,26 @@ db_path: ""
 db_dsn: "$db_dsn_placeholder"
 
 # GeoLite2 edition: "country" (ISO code only) or "city" (adds city name).
-# city uses more storage and CPU — the right edition is auto-downloaded on first run.
+# city uses more storage and CPU.
 geo_type: "$geo_type"
 
 # Path to the GeoLite2 .mmdb file (relative to the binary).
 # Leave blank for the default derived from geo_type.
 geodb_path: ""
 
+# Optional SHA-256 checksum for the GeoLite2 .mmdb file.
+# Leave blank to skip checksum verification.
+geodb_sha256: ""
+
 # Delete visit records older than this many days (cleanup runs every 24 h).
 retention_days: $retention_days
-
-# How often (in days) to remind you to refresh the GeoLite2 DB.
-# MaxMind updates it weekly — bi-weekly is a sensible cadence.
-update_frequency_days: $update_frequency_days
 EOF
 
     echo
     info "Config written  →  $config_path"
     info "Secret salt generated automatically"
+    warn "Place your GeoLite2 .mmdb file under $INSTALL_DIR/data/geodata or set geodb_path before starting gount."
+    warn "If you want startup checksum verification, fill in geodb_sha256 after downloading the file."
     if [[ "$db_type" == "postgres" || "$db_type" == "mysql" ]]; then
         warn "Update db_dsn in config.yaml with your $db_type credentials before starting."
     fi
@@ -307,14 +305,23 @@ proxy_help() {
     if [[ "$PROXY_CHOICE" == "nginx" ]]; then
         label "nginx example"
         cat <<EOF
+limit_req_zone \$binary_remote_addr zone=gount_track:10m rate=20r/s;
+limit_req_zone \$binary_remote_addr zone=gount_health:1m rate=2r/s;
+
 server {
     server_name ${PROXY_DOMAIN};
 
-    location / {
+    location = /t {
+        limit_req          zone=gount_track burst=40 nodelay;
         proxy_pass         http://127.0.0.1:8080;
         proxy_set_header   Host             \$host;
         proxy_set_header   X-Forwarded-For  \$proxy_add_x_forwarded_for;
         proxy_set_header   X-Real-IP        \$remote_addr;
+    }
+
+    location = /health {
+        limit_req          zone=gount_health burst=4 nodelay;
+        proxy_pass         http://127.0.0.1:8080;
     }
 }
 EOF
@@ -349,7 +356,7 @@ write_readme() {
     tee "$readme_path" > /dev/null <<'EOF'
 # gount
 
-A lightweight, privacy-first page-view tracker. No cookies, no external services — just a single binary next to a config file.
+A lightweight, privacy-first beacon endpoint for browser tracking. No cookies, no external services — just a single binary next to a config file.
 
 ---
 
@@ -359,11 +366,11 @@ A lightweight, privacy-first page-view tracker. No cookies, no external services
 ./gount
 ```
 
-On first run, gount will automatically download the GeoLite2 database it needs for geo-lookup. Once it's ready you'll see:
+Before first start:
 
-```
-[init] listening on :8080
-```
+- place the correct GeoLite2 `.mmdb` file in `data/geodata/` or set `geodb_path`
+- optionally set `geodb_sha256` if you want checksum verification
+- keep `secret_salt` unique and private
 
 To use a custom config path:
 
@@ -383,19 +390,18 @@ GET /health  →  200 OK  "ok"
 
 ## Tracking your pages
 
-Add one of the following to any page you want to track. Replace `tracker.example.com` with your own domain or server address.
+Add this to any page you want to track. Replace `tracker.example.com` with your own domain or server address.
 
-**Tracking pixel** (no JavaScript required):
-```html
-<img src="https://tracker.example.com/t?p=/your-page" width="1" height="1" style="display:none" alt="">
-```
-
-**JavaScript fetch** (fires after page load):
+**JavaScript sendBeacon** (fires without keeping the page alive):
 ```html
 <script>
-  fetch('https://tracker.example.com/t?p=' + encodeURIComponent(location.pathname), { keepalive: true });
+  navigator.sendBeacon('https://tracker.example.com/t', new URLSearchParams({
+    p: location.pathname + location.search
+  }));
 </script>
 ```
+
+If you omit `p`, gount stores `/`. If you omit `ref`, gount uses the request `Referer` host when available, otherwise `Direct`.
 
 ---
 
@@ -409,13 +415,21 @@ All settings live in `config.yaml` next to the binary.
 | `server_port` | `8080` | Port the tracker listens on |
 | `secret_salt` | *(generated)* | Salt for hashing visitor IDs — treat like a password |
 | `log_path` | `data/logs/gount.jsonl` | JSONL log file for runtime events |
+| `strict_tracking_errors` | `false` | Return `503` on storage failure instead of always returning `204` |
+| `cors_allowed_origins` | `[]` | Origins allowed to POST to `/t`; empty denies cross-origin use |
 | `real_ip_header` | `auto` | Which trusted proxy header to use for the client IP |
 | `trusted_proxies` | `[]` | IPs/CIDRs allowed to supply `X-Forwarded-For` / `X-Real-IP` |
+| `track_rate_limit_rps` | `20` | Per-IP `/t` request rate limit (`< 0` disables) |
+| `track_rate_limit_burst` | `40` | Per-IP `/t` burst limit |
+| `health_rate_limit_rps` | `2` | Per-IP `/health` request rate limit (`< 0` disables) |
+| `health_rate_limit_burst` | `4` | Per-IP `/health` burst limit |
 | `db_type` | `sqlite` | Storage backend: `sqlite`, `postgres`, `mysql`, `csv`, `json` |
+| `db_path` | *(auto)* | File path for sqlite/csv/json storage |
 | `db_dsn` | *(empty)* | Connection string for postgres/mysql |
 | `geo_type` | `country` | `country` (lightweight) or `city` (more storage + CPU) |
+| `geodb_path` | *(auto)* | Path to the GeoLite2 `.mmdb` file |
+| `geodb_sha256` | *(empty)* | Optional SHA-256 checksum for the GeoLite2 `.mmdb` file |
 | `retention_days` | `90` | Days to keep visit records before auto-deletion |
-| `update_frequency_days` | `14` | Reminder cadence for refreshing the GeoLite2 DB |
 
 ### Rotating the secret salt
 
@@ -438,11 +452,10 @@ trusted_proxies:
 
 ### Refreshing the geo database
 
-MaxMind updates GeoLite2 weekly. To refresh, delete the `.mmdb` file and restart — gount will re-download it automatically:
+Replace the `.mmdb` file with the new copy, update `geodb_sha256` if you verify checksums, and restart:
 
 ```bash
-rm data/geodata/GeoLite2-Country.mmdb
-./gount
+shasum -a 256 data/geodata/GeoLite2-Country.mmdb
 ```
 
 ---
@@ -471,7 +484,7 @@ install_systemd() {
 
     sudo tee /etc/systemd/system/${SERVICE_NAME}.service > /dev/null <<EOF
 [Unit]
-Description=gount — lightweight privacy-first page-view tracker
+Description=gount — lightweight privacy-first beacon endpoint
 After=network.target
 
 [Service]
@@ -519,7 +532,7 @@ main() {
     echo "  ██║   ██║██║   ██║██║   ██║██║╚██╗██║   ██║"
     echo "  ╚██████╔╝╚██████╔╝╚██████╔╝██║ ╚████║   ██║"
     echo "   ╚═════╝  ╚═════╝  ╚═════╝ ╚═╝  ╚═══╝   ╚═╝"
-    echo -e "${NC}  Privacy-first page-view tracker\n"
+    echo -e "${NC}  Privacy-first beacon endpoint\n"
 
     echo -e "  This will build and install gount to ${BOLD}$INSTALL_DIR${NC}."
     echo

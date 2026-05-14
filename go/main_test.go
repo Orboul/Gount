@@ -203,22 +203,38 @@ func TestSQLiteStoreRecoversWhenDatabaseFileIsDeleted(t *testing.T) {
 type stubStore struct {
 	insertErr error
 	healthErr error
+	visits    []visitCall
 }
 
 func (s *stubStore) InsertVisit(uniqueID, country, city, path, referrer string) error {
+	s.visits = append(s.visits, visitCall{
+		uniqueID: uniqueID,
+		country:  country,
+		city:     city,
+		path:     path,
+		referrer: referrer,
+	})
 	return s.insertErr
 }
 func (s *stubStore) DeleteOldVisits(retentionDays int) (int64, error) { return 0, nil }
 func (s *stubStore) HealthCheck() error                               { return s.healthErr }
 func (s *stubStore) Close() error                                     { return nil }
 
-func TestTrackHandlerRejectsPostRequests(t *testing.T) {
+type visitCall struct {
+	uniqueID string
+	country  string
+	city     string
+	path     string
+	referrer string
+}
+
+func TestTrackHandlerRejectsGetRequests(t *testing.T) {
 	app := &App{
 		cfg:   &Config{},
 		store: &stubStore{},
 	}
 
-	req := httptest.NewRequest(http.MethodPost, "/t?p=/home", nil)
+	req := httptest.NewRequest(http.MethodGet, "/t?p=/home", nil)
 	rec := httptest.NewRecorder()
 
 	app.trackHandler(rec, req)
@@ -226,8 +242,130 @@ func TestTrackHandlerRejectsPostRequests(t *testing.T) {
 	if rec.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("status = %d, want %d", rec.Code, http.StatusMethodNotAllowed)
 	}
-	if allow := rec.Header().Get("Allow"); allow != "GET, HEAD, OPTIONS" {
-		t.Fatalf("Allow header = %q, want %q", allow, "GET, HEAD, OPTIONS")
+	if allow := rec.Header().Get("Allow"); allow != "OPTIONS, POST" {
+		t.Fatalf("Allow header = %q, want %q", allow, "OPTIONS, POST")
+	}
+}
+
+func TestTrackHandlerDeniesCrossOriginByDefault(t *testing.T) {
+	app := &App{
+		cfg: &Config{
+			SecretSalt: "test-salt",
+		},
+		store: &stubStore{},
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/t", strings.NewReader("p=%2Fhome"))
+	req.RemoteAddr = "198.51.100.10:443"
+	req.Header.Set("Origin", "https://example.com")
+	rec := httptest.NewRecorder()
+
+	app.trackHandler(rec, req)
+
+	if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "" {
+		t.Fatalf("Access-Control-Allow-Origin = %q, want empty", got)
+	}
+}
+
+func TestTrackHandlerAllowsConfiguredOrigin(t *testing.T) {
+	app := &App{
+		cfg: &Config{
+			SecretSalt:         "test-salt",
+			CORSAllowedOrigins: []string{"https://example.com", "https://www.example.com"},
+		},
+		store: &stubStore{},
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/t", strings.NewReader("p=%2Fhome"))
+	req.RemoteAddr = "198.51.100.10:443"
+	req.Header.Set("Origin", "https://www.example.com")
+	rec := httptest.NewRecorder()
+
+	app.trackHandler(rec, req)
+
+	if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "https://www.example.com" {
+		t.Fatalf("Access-Control-Allow-Origin = %q, want %q", got, "https://www.example.com")
+	}
+}
+
+func TestTrackHandlerDoesNotAllowUnconfiguredOrigin(t *testing.T) {
+	app := &App{
+		cfg: &Config{
+			SecretSalt:         "test-salt",
+			CORSAllowedOrigins: []string{"https://example.com"},
+		},
+		store: &stubStore{},
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/t", strings.NewReader("p=%2Fhome"))
+	req.RemoteAddr = "198.51.100.10:443"
+	req.Header.Set("Origin", "https://not-allowed.example")
+	rec := httptest.NewRecorder()
+
+	app.trackHandler(rec, req)
+
+	if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "" {
+		t.Fatalf("Access-Control-Allow-Origin = %q, want empty", got)
+	}
+}
+
+func TestTrackHandlerAllowsWildcardOriginWhenConfigured(t *testing.T) {
+	app := &App{
+		cfg: &Config{
+			SecretSalt:         "test-salt",
+			CORSAllowedOrigins: []string{"*"},
+		},
+		store: &stubStore{},
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/t", strings.NewReader("p=%2Fhome"))
+	req.RemoteAddr = "198.51.100.10:443"
+	req.Header.Set("Origin", "https://example.com")
+	rec := httptest.NewRecorder()
+
+	app.trackHandler(rec, req)
+
+	if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "*" {
+		t.Fatalf("Access-Control-Allow-Origin = %q, want %q", got, "*")
+	}
+}
+
+func TestTrackHandlerRejectsOversizedPayload(t *testing.T) {
+	app := &App{
+		cfg: &Config{
+			SecretSalt: "test-salt",
+		},
+		store: &stubStore{},
+	}
+
+	body := "p=" + strings.Repeat("a", maxBeaconBody)
+	req := httptest.NewRequest(http.MethodPost, "/t", strings.NewReader(body))
+	req.RemoteAddr = "198.51.100.10:443"
+	rec := httptest.NewRecorder()
+
+	app.trackHandler(rec, req)
+
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusRequestEntityTooLarge)
+	}
+}
+
+func TestTrackHandlerPreflightRejectsUnconfiguredOrigin(t *testing.T) {
+	app := &App{
+		cfg: &Config{
+			SecretSalt: "test-salt",
+		},
+		store: &stubStore{},
+	}
+
+	req := httptest.NewRequest(http.MethodOptions, "/t", nil)
+	req.Header.Set("Origin", "https://example.com")
+	rec := httptest.NewRecorder()
+
+	app.trackHandler(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusForbidden)
 	}
 }
 
@@ -240,7 +378,7 @@ func TestTrackHandlerReturns503WhenStrictTrackingErrorsEnabled(t *testing.T) {
 		store: &stubStore{insertErr: errors.New("boom")},
 	}
 
-	req := httptest.NewRequest(http.MethodGet, "/t?p=/home", nil)
+	req := httptest.NewRequest(http.MethodPost, "/t", strings.NewReader("p=%2Fhome"))
 	req.RemoteAddr = "198.51.100.10:443"
 	rec := httptest.NewRecorder()
 
@@ -248,6 +386,35 @@ func TestTrackHandlerReturns503WhenStrictTrackingErrorsEnabled(t *testing.T) {
 
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, want %d", rec.Code, http.StatusServiceUnavailable)
+	}
+}
+
+func TestTrackHandlerAcceptsBeaconPayload(t *testing.T) {
+	store := &stubStore{}
+	app := &App{
+		cfg: &Config{
+			SecretSalt: "test-salt",
+		},
+		store: store,
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/t", strings.NewReader("p=%2Fpricing%3Fplan%3Dpro&ref=newsletter"))
+	req.RemoteAddr = "198.51.100.10:443"
+	rec := httptest.NewRecorder()
+
+	app.trackHandler(rec, req)
+
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusNoContent)
+	}
+	if len(store.visits) != 1 {
+		t.Fatalf("inserted visits = %d, want 1", len(store.visits))
+	}
+	if got := store.visits[0].path; got != "/pricing?plan=pro" {
+		t.Fatalf("path = %q, want %q", got, "/pricing?plan=pro")
+	}
+	if got := store.visits[0].referrer; got != "newsletter" {
+		t.Fatalf("referrer = %q, want %q", got, "newsletter")
 	}
 }
 
@@ -265,7 +432,39 @@ func TestHealthHandlerReturns503WhenStoreIsUnhealthy(t *testing.T) {
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, want %d", rec.Code, http.StatusServiceUnavailable)
 	}
-	if !strings.Contains(rec.Body.String(), "store not ready") {
-		t.Fatalf("body = %q, want store readiness message", rec.Body.String())
+	if got := strings.TrimSpace(rec.Body.String()); got != "unhealthy" {
+		t.Fatalf("body = %q, want %q", got, "unhealthy")
+	}
+}
+
+func TestHealthHandlerRejectsUnsupportedMethod(t *testing.T) {
+	app := &App{
+		cfg:   &Config{},
+		store: &stubStore{},
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/health", nil)
+	rec := httptest.NewRecorder()
+
+	app.healthHandler(rec, req)
+
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusMethodNotAllowed)
+	}
+	if allow := rec.Header().Get("Allow"); allow != "GET, HEAD" {
+		t.Fatalf("Allow header = %q, want %q", allow, "GET, HEAD")
+	}
+}
+
+func TestIPRateLimiterBlocksBurstWhenExhausted(t *testing.T) {
+	limiter := newIPRateLimiter(1, 1)
+	if limiter == nil {
+		t.Fatal("newIPRateLimiter() = nil, want non-nil")
+	}
+	if !limiter.allow("198.51.100.10") {
+		t.Fatal("first request should pass")
+	}
+	if limiter.allow("198.51.100.10") {
+		t.Fatal("second immediate request should be rate-limited")
 	}
 }
