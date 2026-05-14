@@ -3,7 +3,7 @@ set -euo pipefail
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 REQUIRED="1.24.0"
-REPO="${GOUNT_REPO:-https://github.com/matthewsaw/gount.git}"
+REPO="${GOUNT_REPO:-https://github.com/orboul/gount.git}"
 INSTALL_DIR="$(pwd)"
 SERVICE_NAME="gount"
 PROXY_CHOICE="none"
